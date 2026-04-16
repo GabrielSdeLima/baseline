@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { format, parseISO, isToday } from 'date-fns';
 import { getUserId } from '../config';
@@ -7,7 +8,6 @@ import {
   fetchMeasurements,
   fetchCheckpoints,
   fetchSymptomLogs,
-  nDaysAgoISO,
   todayISO,
 } from '../api/client';
 import SignalBadge from '../components/SignalBadge';
@@ -23,54 +23,67 @@ interface DayRow {
   hasNight: boolean;
 }
 
+function offsetISO(base: Date, days: number): string {
+  const d = new Date(base);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
 export default function Timeline() {
   const userId = getUserId();
-  const today = todayISO();
-  const start = nDaysAgoISO(6); // 7 days inclusive
+  const [weekOffset, setWeekOffset] = useState(0);
+
+  // end = today shifted back by weekOffset weeks; start = end - 6 days
+  const baseEnd = new Date(todayISO() + 'T12:00:00');
+  baseEnd.setDate(baseEnd.getDate() - weekOffset * 7);
+  const endISO = baseEnd.toISOString().slice(0, 10);
+  const startISO = offsetISO(baseEnd, -6);
+
+  const rangeLabel = weekOffset === 0
+    ? 'Last 7 days'
+    : `${format(parseISO(startISO), 'MMM d')} – ${format(parseISO(endISO), 'MMM d')}`;
 
   const illnessQ = useQuery({
-    queryKey: ['illness', userId, start, today],
-    queryFn: () => fetchIllnessSignal(userId, start, today),
+    queryKey: ['illness', userId, startISO, endISO],
+    queryFn: () => fetchIllnessSignal(userId, startISO, endISO),
     enabled: !!userId,
     staleTime: 5 * 60 * 1000,
   });
 
   const recoveryQ = useQuery({
-    queryKey: ['recovery', userId, start, today],
-    queryFn: () => fetchRecoveryStatus(userId, start, today),
+    queryKey: ['recovery', userId, startISO, endISO],
+    queryFn: () => fetchRecoveryStatus(userId, startISO, endISO),
     enabled: !!userId,
     staleTime: 5 * 60 * 1000,
   });
 
   const hrvQ = useQuery({
-    queryKey: ['measurements', userId, 'hrv_rmssd', 7],
+    queryKey: ['measurements', userId, 'hrv_rmssd', startISO, endISO],
     queryFn: () => fetchMeasurements(userId, 'hrv_rmssd', 7),
     enabled: !!userId,
     staleTime: 5 * 60 * 1000,
   });
 
   const checkpointsQ = useQuery({
-    queryKey: ['checkpoints', userId, start, today],
-    queryFn: () => fetchCheckpoints(userId, start, today),
+    queryKey: ['checkpoints', userId, startISO, endISO],
+    queryFn: () => fetchCheckpoints(userId, startISO, endISO),
     enabled: !!userId,
     staleTime: 5 * 60 * 1000,
   });
 
   const symptomsQ = useQuery({
     queryKey: ['symptomLogs', userId],
-    queryFn: () => fetchSymptomLogs(userId, 50),
+    queryFn: () => fetchSymptomLogs(userId, 200),
     enabled: !!userId,
     staleTime: 5 * 60 * 1000,
   });
 
   const isLoading = illnessQ.isLoading || recoveryQ.isLoading || hrvQ.isLoading;
 
-  // Build date range for last 7 days, most recent first
+  // Build date range for the selected week, most recent first
   const dates: string[] = [];
   for (let i = 0; i < 7; i++) {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    dates.push(d.toISOString().slice(0, 10));
+    dates.push(offsetISO(baseEnd, -i));
   }
 
   // Index data by date
@@ -94,6 +107,7 @@ export default function Timeline() {
   const symptomsByDay: Record<string, { count: number; dominant: string | null }> = {};
   for (const sl of symptomsQ.data?.items ?? []) {
     const day = sl.started_at.slice(0, 10);
+    if (day < startISO || day > endISO) continue;
     if (!symptomsByDay[day]) symptomsByDay[day] = { count: 0, dominant: null };
     symptomsByDay[day].count++;
     if (!symptomsByDay[day].dominant) symptomsByDay[day].dominant = sl.symptom_slug;
@@ -134,7 +148,24 @@ export default function Timeline() {
 
   return (
     <div>
-      <p className="text-xs text-gray-400 mb-3">Last 7 days</p>
+      <div className="flex items-center justify-between mb-3">
+        <p className="text-xs text-gray-400">{rangeLabel}</p>
+        <div className="flex gap-1">
+          <button
+            onClick={() => setWeekOffset((w) => w + 1)}
+            className="px-2 py-0.5 text-xs border border-gray-200 rounded hover:border-gray-400 text-gray-500 hover:text-gray-900 transition-colors"
+          >
+            ‹ Prev
+          </button>
+          <button
+            onClick={() => setWeekOffset((w) => w - 1)}
+            disabled={weekOffset === 0}
+            className="px-2 py-0.5 text-xs border border-gray-200 rounded hover:border-gray-400 text-gray-500 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            Next ›
+          </button>
+        </div>
+      </div>
       <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
         <table className="w-full text-xs">
           <thead>

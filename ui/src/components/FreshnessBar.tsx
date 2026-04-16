@@ -1,7 +1,10 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { isToday, isYesterday, parseISO, format } from 'date-fns';
 import { fetchMeasurements, fetchCheckpoints, scanScale, todayISO } from '../api/client';
+import { loadScaleProfile } from '../lib/scaleProfile';
+
+const SCAN_TIMEOUT_S = 45;
 
 function dotClass(dateStr: string | null): string {
   if (!dateStr) return 'bg-gray-300';
@@ -37,9 +40,14 @@ export default function FreshnessBar({ userId }: Props) {
   const today = todayISO();
   const qc = useQueryClient();
   const [scaleMsg, setScaleMsg] = useState('');
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const scaleMut = useMutation({
-    mutationFn: () => scanScale(userId),
+    mutationFn: () => {
+      abortRef.current = new AbortController();
+      return scanScale(userId, abortRef.current.signal, loadScaleProfile());
+    },
     onSuccess: (data) => {
       setScaleMsg(data.message);
       qc.invalidateQueries({ queryKey: ['freshness-scale'] });
@@ -47,10 +55,34 @@ export default function FreshnessBar({ userId }: Props) {
       setTimeout(() => setScaleMsg(''), 5000);
     },
     onError: (e: Error) => {
-      setScaleMsg(e.message);
-      setTimeout(() => setScaleMsg(''), 8000);
+      if (e.name !== 'AbortError') {
+        setScaleMsg(e.message);
+        setTimeout(() => setScaleMsg(''), 8000);
+      }
     },
   });
+
+  useEffect(() => {
+    if (!scaleMut.isPending) {
+      setCountdown(null);
+      return;
+    }
+    let remaining = SCAN_TIMEOUT_S;
+    setCountdown(remaining);
+    const id = setInterval(() => {
+      remaining -= 1;
+      setCountdown(remaining <= 0 ? 0 : remaining);
+      if (remaining <= 0) clearInterval(id);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [scaleMut.isPending]);
+
+  function handleCancel() {
+    abortRef.current?.abort();
+    scaleMut.reset();
+    setCountdown(null);
+    setScaleMsg('');
+  }
 
   const garminQ = useQuery({
     queryKey: ['freshness-garmin', userId],
@@ -97,8 +129,17 @@ export default function FreshnessBar({ userId }: Props) {
           disabled={scaleMut.isPending}
           className="ml-1 px-1.5 py-0.5 text-[10px] font-medium border border-gray-200 rounded hover:border-gray-400 text-gray-500 hover:text-gray-900 disabled:opacity-50 transition-colors"
         >
-          {scaleMut.isPending ? 'Scanning…' : 'Scan'}
+          {scaleMut.isPending ? `Scanning… ${countdown ?? SCAN_TIMEOUT_S}s` : 'Scan'}
         </button>
+        {scaleMut.isPending && (
+          <button
+            onClick={handleCancel}
+            aria-label="Cancel scan"
+            className="px-1 py-0.5 text-[10px] text-gray-400 hover:text-gray-700 transition-colors"
+          >
+            ✕
+          </button>
+        )}
       </span>
       {scaleMsg && (
         <span className={`text-[10px] ${scaleMut.isError ? 'text-red-400' : 'text-green-500'}`}>

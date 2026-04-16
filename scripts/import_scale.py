@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -39,10 +40,13 @@ import httpx
 
 _SCRIPTS_DIR = Path(__file__).parent
 _PROFILE_PATH = _SCRIPTS_DIR / "scale_profile.json"
-_PULSO_APP_DIR = Path("C:/src/pulso/pulso-app")
+_PULSO_APP_DIR = Path(
+    os.environ.get("BASELINE_PULSO_APP_DIR", "C:/src/pulso/pulso-app")
+)
 _DART_CLI_NAME = "tools/decode_scale.dart"
 
-_DEFAULT_API_URL = "http://localhost:8000"
+_DEFAULT_API_URL = os.environ.get("BASELINE_API_URL", "http://localhost:8000")
+_DEFAULT_USER_ID = os.environ.get("BASELINE_USER_ID")
 
 logger = logging.getLogger(__name__)
 
@@ -382,9 +386,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--user-id",
-        required=True,
+        default=_DEFAULT_USER_ID,
+        required=_DEFAULT_USER_ID is None,
         metavar="UUID",
-        help="Baseline user UUID to associate the measurement with",
+        help=(
+            "Baseline user UUID to associate the measurement with "
+            "(falls back to BASELINE_USER_ID env var)"
+        ),
     )
     p.add_argument(
         "--mac",

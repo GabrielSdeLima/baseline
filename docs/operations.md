@@ -10,8 +10,10 @@ All operations below assume:
 
 ```bash
 docker compose up -d          # PostgreSQL on port 5433
-uvicorn app.main:app --reload  # API on port 8000 (or --port 8001 for dev)
+uvicorn app.main:app --reload  # API on port 8000 (or --port 8001 for dev with Vite proxy)
 ```
+
+Scripts read `BASELINE_API_URL` from the environment (default: `http://localhost:8000`). Override per-invocation with `--api-url`, or export `BASELINE_API_URL=http://localhost:8001` when the API is running on the dev port.
 
 Your user UUID is stored in the browser's `localStorage` under `baseline_user_id`. Retrieve it from the database if needed:
 
@@ -56,6 +58,44 @@ Tokens are persisted after the first authentication. If MFA is enabled on your G
 ### Freshness check
 
 The Today page's FreshnessBar shows when the most recent `hrv_rmssd` was recorded. If it says "yesterday" or older, run the sync.
+
+### Auto-sync (built into the API)
+
+The FastAPI lifespan runs a scheduler that keeps Garmin data current with zero manual intervention:
+
+1. **Startup catch-up** — when the API boots, it looks up the most recent Garmin measurement for `BASELINE_USER_ID` and backfills every missed day up to today (7-day initial backfill for a fresh user). Garmin stores data in their cloud, so PC downtime never causes data loss.
+2. **Recurring loop** — every `SYNC_INTERVAL_MIN` minutes (default 60) pulls the last day so intraday updates (sleep score, body battery) are captured as Garmin emits them.
+
+Required env vars (see `.env.example`):
+
+```bash
+BASELINE_USER_ID=<your-uuid>
+SYNC_INTERVAL_MIN=60        # set to 0 to disable the recurring loop (catch-up still runs)
+```
+
+If prerequisites are missing (`BASELINE_USER_ID` unset, `scripts/garmin_config.json` absent), the scheduler logs one info line and exits quietly — the API keeps serving normally.
+
+### Auto-start on Windows log-on (optional)
+
+To have the API start automatically whenever you log in to Windows — no terminal required:
+
+```powershell
+# One-time setup (per user, no admin rights needed)
+powershell -ExecutionPolicy Bypass -File scripts\register_autostart.ps1
+```
+
+This registers a Task Scheduler entry named `BaselineAPI` with an `-AtLogOn` trigger. The task runs `scripts\start_api.ps1`, which activates the venv, loads `.env`, and launches `uvicorn`.
+
+Useful commands:
+
+```powershell
+Start-ScheduledTask    -TaskName BaselineAPI               # run now (for testing)
+Stop-ScheduledTask     -TaskName BaselineAPI               # stop the running instance
+Get-ScheduledTaskInfo  -TaskName BaselineAPI               # last run time and result
+Unregister-ScheduledTask -TaskName BaselineAPI -Confirm:$false   # remove
+```
+
+Combined with auto-sync, this means: **turn the PC on → API starts → Garmin backfills any gap → data stays fresh hourly** for as long as the machine is on.
 
 ---
 

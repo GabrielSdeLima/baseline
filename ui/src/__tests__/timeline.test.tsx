@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import Timeline from '../pages/Timeline';
 import * as client from '../api/client';
@@ -104,5 +105,61 @@ describe('Timeline — table and legend (E2)', () => {
   it('shows "Last 7 days" heading', async () => {
     renderTimeline();
     await waitFor(() => expect(screen.getByText('Last 7 days')).toBeInTheDocument());
+  });
+});
+
+describe('Timeline — week navigation', () => {
+  beforeEach(() => {
+    vi.mocked(client.fetchIllnessSignal).mockResolvedValue(emptyIllness);
+    vi.mocked(client.fetchRecoveryStatus).mockResolvedValue(emptyRecovery);
+    vi.mocked(client.fetchMeasurements).mockResolvedValue({ items: [], total: 0, offset: 0, limit: 7 });
+    vi.mocked(client.fetchCheckpoints).mockResolvedValue({ items: [], total: 0, offset: 0, limit: 14 });
+    vi.mocked(client.fetchSymptomLogs).mockResolvedValue({ items: [], total: 0, offset: 0, limit: 200 });
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('renders Prev and Next buttons', async () => {
+    renderTimeline();
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /prev/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /next/i })).toBeInTheDocument();
+    });
+  });
+
+  it('Next button is disabled on current week', async () => {
+    renderTimeline();
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /next/i })).toBeDisabled()
+    );
+  });
+
+  it('Prev shifts to date range label (not "Last 7 days")', async () => {
+    const user = userEvent.setup();
+    renderTimeline();
+    await waitFor(() => screen.getByRole('button', { name: /prev/i }));
+    await user.click(screen.getByRole('button', { name: /prev/i }));
+    await waitFor(() =>
+      expect(screen.queryByText('Last 7 days')).not.toBeInTheDocument()
+    );
+    // date range label like "Apr 1 – Apr 7" should appear
+    expect(screen.getByText(/\w{3} \d+ – \w{3} \d+/)).toBeInTheDocument();
+  });
+
+  it('Next becomes enabled after going back, restores "Last 7 days" after clicking Next', async () => {
+    const user = userEvent.setup();
+    renderTimeline();
+    await waitFor(() => screen.getByRole('button', { name: /prev/i }));
+    await user.click(screen.getByRole('button', { name: /prev/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /next/i })).not.toBeDisabled());
+    await user.click(screen.getByRole('button', { name: /next/i }));
+    await waitFor(() => expect(screen.getByText('Last 7 days')).toBeInTheDocument());
+  });
+
+  it('does not show ·today marker when viewing a past week', async () => {
+    const user = userEvent.setup();
+    renderTimeline();
+    await waitFor(() => screen.getByRole('button', { name: /prev/i }));
+    await user.click(screen.getByRole('button', { name: /prev/i }));
+    await waitFor(() => expect(screen.queryByText('·today')).not.toBeInTheDocument());
   });
 });

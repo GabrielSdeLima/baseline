@@ -4,7 +4,9 @@ import { getUserId } from './config';
 import Nav from './components/Nav';
 import Today from './pages/Today';
 import Timeline from './pages/Timeline';
+import History from './pages/History';
 import Medications from './pages/Medications';
+import Settings from './pages/Settings';
 import UserSetup from './pages/UserSetup';
 import QuickInputModal from './components/QuickInputModal';
 
@@ -17,7 +19,7 @@ const queryClient = new QueryClient({
   },
 });
 
-type View = 'today' | 'timeline' | 'medications';
+type View = 'today' | 'timeline' | 'history' | 'medications' | 'settings';
 
 export default function App() {
   const userId = getUserId();
@@ -43,7 +45,9 @@ function AppShell() {
       <main className="max-w-2xl mx-auto px-4 py-6">
         {view === 'today' && <Today />}
         {view === 'timeline' && <Timeline />}
+        {view === 'history' && <History />}
         {view === 'medications' && <Medications />}
+        {view === 'settings' && <Settings />}
       </main>
       {inputOpen && <QuickInputModal onClose={() => setInputOpen(false)} />}
     </div>

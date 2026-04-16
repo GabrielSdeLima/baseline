@@ -81,6 +81,8 @@ npm --prefix ui run dev
 # Visit http://localhost:5173
 ```
 
+Scripts read `BASELINE_API_URL` from the environment and default to `http://localhost:8000`. Override via `BASELINE_API_URL=http://localhost:8001 python scripts/sync_garmin.py ...` (or the `--api-url` flag) when running against the dev-mode API.
+
 ### Run analytical queries (after seeding)
 
 ```bash

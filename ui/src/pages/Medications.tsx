@@ -6,7 +6,9 @@ import {
   fetchMedicationDefinitions,
   createMedicationDefinition,
   createMedicationRegimen,
+  createMedicationLog,
   deactivateRegimen,
+  nowISO,
   todayISO,
 } from '../api/client';
 import type { MedicationRegimenResponse } from '../api/types';
@@ -29,10 +31,16 @@ function RegimenCard({
   regimen,
   onDeactivate,
   deactivating,
+  onLog,
+  logging,
+  logFeedback,
 }: {
   regimen: MedicationRegimenResponse;
   onDeactivate?: () => void;
   deactivating?: boolean;
+  onLog?: () => void;
+  logging?: boolean;
+  logFeedback?: { ok: boolean; msg: string } | null;
 }) {
   return (
     <div className="bg-white border border-gray-200 rounded-lg p-3 space-y-1">
@@ -45,14 +53,32 @@ function RegimenCard({
             {regimen.dosage_amount} {regimen.dosage_unit} &middot; {formatFreq(regimen.frequency)}
           </span>
         </div>
-        {regimen.is_active && onDeactivate && (
-          <button
-            onClick={onDeactivate}
-            disabled={deactivating}
-            className="text-xs text-red-400 hover:text-red-600 disabled:opacity-50 transition-colors"
-          >
-            {deactivating ? 'Stopping…' : 'Stop'}
-          </button>
+        {regimen.is_active && (
+          <div className="flex items-center gap-2">
+            {onLog && (
+              <button
+                onClick={onLog}
+                disabled={logging}
+                className="text-xs text-blue-400 hover:text-blue-600 disabled:opacity-50 transition-colors"
+              >
+                {logging ? '…' : 'Log'}
+              </button>
+            )}
+            {logFeedback && (
+              <span className={`text-xs ${logFeedback.ok ? 'text-green-500' : 'text-red-400'}`}>
+                {logFeedback.ok ? '✓ Logged' : logFeedback.msg}
+              </span>
+            )}
+            {onDeactivate && (
+              <button
+                onClick={onDeactivate}
+                disabled={deactivating}
+                className="text-xs text-red-400 hover:text-red-600 disabled:opacity-50 transition-colors"
+              >
+                {deactivating ? 'Stopping…' : 'Stop'}
+              </button>
+            )}
+          </div>
         )}
       </div>
       <div className="text-xs text-gray-400">
@@ -299,6 +325,7 @@ export default function Medications() {
   const qc = useQueryClient();
   const [showForm, setShowForm] = useState(false);
   const [showPast, setShowPast] = useState(false);
+  const [logFeedback, setLogFeedback] = useState<Record<string, { ok: boolean; msg: string }>>({});
 
   const regimensQ = useQuery({
     queryKey: ['allRegimens', userId],
@@ -312,6 +339,30 @@ export default function Medications() {
       qc.invalidateQueries({ queryKey: ['allRegimens'] });
       qc.invalidateQueries({ queryKey: ['activeRegimens'] });
       qc.invalidateQueries({ queryKey: ['adherence'] });
+    },
+  });
+
+  const logMut = useMutation({
+    mutationFn: (regimenId: string) => {
+      const now = nowISO();
+      return createMedicationLog({
+        user_id: userId,
+        regimen_id: regimenId,
+        status: 'taken',
+        scheduled_at: now,
+        taken_at: now,
+        recorded_at: now,
+      });
+    },
+    onSuccess: (_data, regimenId) => {
+      setLogFeedback((prev) => ({ ...prev, [regimenId]: { ok: true, msg: '' } }));
+      setTimeout(() => setLogFeedback((prev) => { const n = { ...prev }; delete n[regimenId]; return n; }), 3000);
+      qc.invalidateQueries({ queryKey: ['adherence'] });
+      qc.invalidateQueries({ queryKey: ['medLogs'] });
+    },
+    onError: (e: Error, regimenId) => {
+      setLogFeedback((prev) => ({ ...prev, [regimenId]: { ok: false, msg: e.message } }));
+      setTimeout(() => setLogFeedback((prev) => { const n = { ...prev }; delete n[regimenId]; return n; }), 5000);
     },
   });
 
@@ -357,6 +408,9 @@ export default function Medications() {
             regimen={r}
             onDeactivate={() => deactivateMut.mutate(r.id)}
             deactivating={deactivateMut.isPending}
+            onLog={() => logMut.mutate(r.id)}
+            logging={logMut.isPending && logMut.variables === r.id}
+            logFeedback={logFeedback[r.id] ?? null}
           />
         ))}
       </div>

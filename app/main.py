@@ -1,3 +1,6 @@
+import asyncio
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -5,11 +8,31 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
+from app.services.garmin_scheduler import run_scheduler
+
+_logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(run_scheduler())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _logger.exception("[lifespan] scheduler task raised on shutdown")
+
 
 app = FastAPI(
     title="Baseline",
     version="0.1.0",
     description="Personal longitudinal health data platform",
+    lifespan=lifespan,
 )
 
 app.include_router(api_router)

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import FreshnessBar from '../components/FreshnessBar';
 import * as client from '../api/client';
@@ -26,6 +27,7 @@ vi.mock('../api/client', async () => {
     createSymptomLog: vi.fn(),
     createMedicationLog: vi.fn(),
     createMeasurement: vi.fn(),
+    scanScale: vi.fn(),
   };
 });
 
@@ -168,5 +170,77 @@ describe('FreshnessBar — per-source chips (A2)', () => {
     });
     renderFreshnessBar();
     await waitFor(() => expect(screen.getByText('morning + night')).toBeInTheDocument());
+  });
+});
+
+describe('FreshnessBar — Scan button', () => {
+  beforeEach(() => {
+    vi.mocked(client.fetchMeasurements).mockResolvedValue(emptyMeasurements);
+    vi.mocked(client.fetchCheckpoints).mockResolvedValue(emptyCheckpoints);
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('renders Scan button next to Scale chip', async () => {
+    renderFreshnessBar();
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /^scan$/i })).toBeInTheDocument()
+    );
+  });
+
+  it('calls scanScale with userId when clicked', async () => {
+    vi.mocked(client.scanScale).mockResolvedValue({ status: 'ok', message: 'Weight imported: 81.0 kg' });
+    const user = userEvent.setup();
+    renderFreshnessBar();
+    await waitFor(() => screen.getByRole('button', { name: /^scan$/i }));
+    await user.click(screen.getByRole('button', { name: /^scan$/i }));
+    expect(client.scanScale).toHaveBeenCalledWith(USER_ID, expect.any(AbortSignal), expect.any(Object));
+  });
+
+  it('shows "Scanning… 45s" and disables button while pending', async () => {
+    vi.mocked(client.scanScale).mockReturnValue(new Promise(() => {}));
+    const user = userEvent.setup();
+    renderFreshnessBar();
+    await waitFor(() => screen.getByRole('button', { name: /^scan$/i }));
+    await user.click(screen.getByRole('button', { name: /^scan$/i }));
+    await waitFor(() => expect(screen.getByText(/Scanning… \d+s/)).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: /scanning/i })).toBeDisabled();
+  });
+
+  it('shows cancel button while pending', async () => {
+    vi.mocked(client.scanScale).mockReturnValue(new Promise(() => {}));
+    const user = userEvent.setup();
+    renderFreshnessBar();
+    await waitFor(() => screen.getByRole('button', { name: /^scan$/i }));
+    await user.click(screen.getByRole('button', { name: /^scan$/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /cancel scan/i })).toBeInTheDocument());
+  });
+
+  it('restores Scan button after cancel', async () => {
+    vi.mocked(client.scanScale).mockReturnValue(new Promise(() => {}));
+    const user = userEvent.setup();
+    renderFreshnessBar();
+    await waitFor(() => screen.getByRole('button', { name: /^scan$/i }));
+    await user.click(screen.getByRole('button', { name: /^scan$/i }));
+    await waitFor(() => screen.getByRole('button', { name: /cancel scan/i }));
+    await user.click(screen.getByRole('button', { name: /cancel scan/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /^scan$/i })).toBeInTheDocument());
+  });
+
+  it('shows success message after scan completes', async () => {
+    vi.mocked(client.scanScale).mockResolvedValue({ status: 'ok', message: 'Weight imported: 81.0 kg' });
+    const user = userEvent.setup();
+    renderFreshnessBar();
+    await waitFor(() => screen.getByRole('button', { name: /^scan$/i }));
+    await user.click(screen.getByRole('button', { name: /^scan$/i }));
+    await waitFor(() => expect(screen.getByText('Weight imported: 81.0 kg')).toBeInTheDocument());
+  });
+
+  it('shows error message when scan fails', async () => {
+    vi.mocked(client.scanScale).mockRejectedValue(new Error('Scale not found'));
+    const user = userEvent.setup();
+    renderFreshnessBar();
+    await waitFor(() => screen.getByRole('button', { name: /^scan$/i }));
+    await user.click(screen.getByRole('button', { name: /^scan$/i }));
+    await waitFor(() => expect(screen.getByText('Scale not found')).toBeInTheDocument());
   });
 });

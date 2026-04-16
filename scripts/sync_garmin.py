@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -55,7 +56,8 @@ _GARMINCONNECT_MISSING_MSG = (
 
 _SCRIPTS_DIR = Path(__file__).parent
 _CONFIG_PATH = _SCRIPTS_DIR / "garmin_config.json"
-_DEFAULT_API_URL = "http://localhost:8000"
+_DEFAULT_API_URL = os.environ.get("BASELINE_API_URL", "http://localhost:8000")
+_DEFAULT_USER_ID = os.environ.get("BASELINE_USER_ID")
 
 logger = logging.getLogger(__name__)
 
@@ -358,9 +360,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--user-id",
-        required=True,
+        default=_DEFAULT_USER_ID,
+        required=_DEFAULT_USER_ID is None,
         metavar="UUID",
-        help="Baseline user UUID to associate measurements with",
+        help=(
+            "Baseline user UUID to associate measurements with "
+            "(falls back to BASELINE_USER_ID env var)"
+        ),
     )
 
     date_group = p.add_mutually_exclusive_group()

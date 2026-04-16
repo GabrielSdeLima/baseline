@@ -1,3 +1,4 @@
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -9,6 +10,7 @@ from app.schemas.raw_payload import RawPayloadIngest, RawPayloadList, RawPayload
 from app.services.ingestion import IngestionService
 
 router = APIRouter(prefix="/raw-payloads", tags=["ingestion"])
+_logger = logging.getLogger(__name__)
 
 
 @router.post("/ingest", status_code=201, response_model=RawPayloadResponse)
@@ -23,6 +25,9 @@ async def ingest_raw_payload(
         return RawPayloadResponse.model_validate(payload)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        _logger.exception("Unhandled error in ingest endpoint")
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {type(e).__name__}")
 
 
 @router.get("/", response_model=RawPayloadList)

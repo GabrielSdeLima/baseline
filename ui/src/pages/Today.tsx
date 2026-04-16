@@ -12,6 +12,36 @@ import InsightCard from '../components/InsightCard';
 import SignalBadge from '../components/SignalBadge';
 import FreshnessBar from '../components/FreshnessBar';
 
+type TrendDir = '↑' | '↓' | '→';
+
+interface HrvTrend {
+  dir: TrendDir;
+  streakDays: number;
+  latestMs: number | null;
+}
+
+function computeHrvTrend(items: Array<{ measured_at: string; value_num: number }>): HrvTrend | null {
+  const sorted = [...items]
+    .sort((a, b) => a.measured_at.localeCompare(b.measured_at))
+    .map((m) => Number(m.value_num));
+  if (sorted.length < 2) return null;
+  const latest = sorted[sorted.length - 1];
+  const prev = sorted.slice(0, -1);
+  const prevAvg = prev.reduce((s, v) => s + v, 0) / prev.length;
+  const pct = (latest - prevAvg) / prevAvg;
+  const dir: TrendDir = pct > 0.03 ? '↑' : pct < -0.03 ? '↓' : '→';
+
+  // Count consecutive days at same direction (each consecutive pair)
+  let streak = 1;
+  for (let i = sorted.length - 2; i >= 1; i--) {
+    const d = sorted[i] - sorted[i - 1];
+    const dDir: TrendDir = d / sorted[i - 1] > 0.03 ? '↑' : d / sorted[i - 1] < -0.03 ? '↓' : '→';
+    if (dDir === dir) streak++;
+    else break;
+  }
+  return { dir, streakDays: streak, latestMs: latest };
+}
+
 const METRIC_UNITS: Record<string, string> = {
   hrv_rmssd: 'ms',
   resting_hr: 'bpm',
@@ -65,6 +95,10 @@ export default function Today() {
   const baselineForming =
     !hrvCountQ.isLoading && (hrvCountQ.data?.total ?? 0) < 3;
 
+  const hrvTrend = hrvCountQ.data?.items.length
+    ? computeHrvTrend(hrvCountQ.data.items)
+    : null;
+
   const todayDeviations = deviationsQ.data?.deviations.filter(
     (d) => d.day === today
   ) ?? [];
@@ -101,9 +135,16 @@ export default function Today() {
         {summary && (
           <div>
             <SignalBadge signal={summary.illness_signal} />
-            {summary.illness_signal === 'insufficient_data' && (
+            {summary.illness_signal === 'insufficient_data' ? (
               <p className="text-xs text-gray-400 mt-1">
                 establishing baseline · fewer than 3 data points
+              </p>
+            ) : hrvTrend && (
+              <p className="text-xs text-gray-400 mt-1 font-mono">
+                HRV {hrvTrend.dir} {hrvTrend.streakDays}d
+                {hrvTrend.latestMs != null && (
+                  <span className="ml-1">· {Math.round(hrvTrend.latestMs)} ms</span>
+                )}
               </p>
             )}
           </div>
@@ -121,9 +162,16 @@ export default function Today() {
         {summary && (
           <div>
             <SignalBadge signal={summary.recovery_status} />
-            {summary.recovery_status === 'insufficient_data' && (
+            {summary.recovery_status === 'insufficient_data' ? (
               <p className="text-xs text-gray-400 mt-1">
                 establishing baseline · fewer than 3 data points
+              </p>
+            ) : hrvTrend && (
+              <p className="text-xs text-gray-400 mt-1 font-mono">
+                HRV {hrvTrend.dir} {hrvTrend.streakDays}d
+                {hrvTrend.latestMs != null && (
+                  <span className="ml-1">· {Math.round(hrvTrend.latestMs)} ms</span>
+                )}
               </p>
             )}
           </div>

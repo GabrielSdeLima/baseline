@@ -1,9 +1,11 @@
-type View = 'today' | 'timeline' | 'medications';
+type View = 'today' | 'timeline' | 'history' | 'medications' | 'settings';
 
 const VIEW_LABELS: Record<View, string> = {
   today: 'Today',
   timeline: 'Timeline',
+  history: 'History',
   medications: 'Meds',
+  settings: 'Settings',
 };
 
 interface Props {

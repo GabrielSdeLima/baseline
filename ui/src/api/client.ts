@@ -135,8 +135,14 @@ export const deactivateRegimen = (regimenId: string, userId: string) =>
   });
 
 // Integrations
-export const scanScale = (userId: string) =>
+export interface ScaleProfileParams {
+  height_cm?: number;
+  birth_date?: string;
+  sex?: number;
+}
+
+export const scanScale = (userId: string, signal?: AbortSignal, profile?: ScaleProfileParams) =>
   apiFetch<{ status: string; message: string }>(
-    `/integrations/scale/scan${qs({ user_id: userId })}`,
-    { method: 'POST' }
+    `/integrations/scale/scan${qs({ user_id: userId, ...profile })}`,
+    { method: 'POST', signal }
   );
