@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy this file to garmin_config.json and fill in your values. garmin_config.json is gitignored.",
+  "email": "your.garmin@email.com",
+  "password": "your-garmin-connect-password",
+  "token_store": "~/.config/garmin/tokens",
+  "user_timezone": "America/Sao_Paulo"
+}

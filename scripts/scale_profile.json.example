@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy this file to scale_profile.json and fill in your values. scale_profile.json is gitignored.",
+  "height_cm": 175,
+  "birth_date": "1990-05-20",
+  "sex": 1
+}
