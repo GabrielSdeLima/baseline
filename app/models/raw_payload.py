@@ -37,6 +37,13 @@ class RawPayload(Base):
     processing_status: Mapped[str] = mapped_column(String(31), server_default="pending")
     processed_at: Mapped[datetime | None] = mapped_column(default=None)
     error_message: Mapped[str | None] = mapped_column(default=None)
+    # Operational provenance — nullable; existing payloads remain valid with NULL
+    user_device_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("user_devices.id", ondelete="SET NULL"), default=None
+    )
+    agent_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agent_instances.id", ondelete="SET NULL"), default=None
+    )
 
     # Relationships
     user: Mapped["User"] = relationship(back_populates="raw_payloads")  # noqa: F821
@@ -44,3 +51,5 @@ class RawPayload(Base):
     measurements: Mapped[list["Measurement"]] = relationship(  # noqa: F821
         back_populates="raw_payload"
     )
+    user_device: Mapped["UserDevice | None"] = relationship()  # noqa: F821
+    agent_instance: Mapped["AgentInstance | None"] = relationship()  # noqa: F821

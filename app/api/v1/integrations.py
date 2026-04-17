@@ -2,14 +2,20 @@
 import asyncio
 import sys
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.dependencies import get_db
+from app.models.agent_instance import AgentInstance
+from app.models.data_source import DataSource
+from app.models.ingestion_run import IngestionRun
+from app.models.user_device import UserDevice
 from app.schemas.scale import LatestScaleReading
 from app.services.scale import ScaleService
 
@@ -62,22 +68,104 @@ async def scan_scale(
     birth_date: str | None = Query(None),
     sex: int | None = Query(None),
     mac: str | None = Query(None),
+    x_idempotency_key: str | None = Header(None, alias="X-Idempotency-Key"),
+    db: AsyncSession = Depends(get_db),
 ):
     """Trigger a BLE scan for the HC900 scale, decode, and ingest.
 
-    Runs scripts/import_scale.py as a subprocess. Requires:
-    - bleak installed (pip install bleak)
-    - scripts/scale_profile.json configured (or height_cm/birth_date/sex params)
-
-    Decoding is native Python (app.integrations.hc900) — no external runtime.
-
-    Subprocess timeout is controlled by ``SCALE_SCAN_TIMEOUT`` (default 45s).
+    Creates an IngestionRun before launching import_scale.py and closes it as
+    completed/failed afterward.  Accepts X-Idempotency-Key to deduplicate
+    double-clicks.  Rejects concurrent scans for the same user with 409.
     """
     script = _SCRIPTS_DIR / "import_scale.py"
     if not script.exists():
         raise HTTPException(status_code=500, detail="import_scale.py not found")
 
-    cmd = [sys.executable, str(script), "--user-id", str(user_id)]
+    # Resolve source
+    source_id: int | None = await db.scalar(
+        select(DataSource.id).where(DataSource.slug == "hc900_ble")
+    )
+    if source_id is None:
+        raise HTTPException(status_code=500, detail="hc900_ble data source not found")
+
+    # Idempotency dedup
+    if x_idempotency_key is not None:
+        existing = await db.scalar(
+            select(IngestionRun).where(
+                IngestionRun.idempotency_key == x_idempotency_key
+            )
+        )
+        if existing is not None:
+            if existing.status == "running":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Scan already in progress for this idempotency key",
+                )
+            if existing.status == "completed":
+                return {"status": "ok", "message": "Already completed (idempotent)"}
+            # status == "failed" → retry: release the key so the new run may claim it
+            existing.idempotency_key = None
+            await db.flush()
+
+    # Anti-overlap: any running ble_scan for this user/source → 409
+    overlap = await db.scalar(
+        select(IngestionRun).where(
+            IngestionRun.user_id == user_id,
+            IngestionRun.source_id == source_id,
+            IngestionRun.operation_type == "ble_scan",
+            IngestionRun.status == "running",
+        )
+    )
+    if overlap is not None:
+        raise HTTPException(status_code=409, detail="A scale scan is already in progress")
+
+    # Device provenance — best-effort lookup by MAC, never auto-created
+    user_device_id: uuid.UUID | None = None
+    if mac is not None:
+        normalized = mac.replace(":", "").lower()
+        device = await db.scalar(
+            select(UserDevice).where(
+                UserDevice.user_id == user_id,
+                UserDevice.identifier == normalized,
+                UserDevice.identifier_type == "mac",
+                UserDevice.is_active.is_(True),
+            )
+        )
+        if device is not None:
+            user_device_id = device.id
+
+    # Agent instance provenance — active local agent, if any
+    agent_instance_id: uuid.UUID | None = None
+    agent = await db.scalar(
+        select(AgentInstance).where(
+            AgentInstance.user_id == user_id,
+            AgentInstance.is_active.is_(True),
+        )
+    )
+    if agent is not None:
+        agent_instance_id = agent.id
+
+    # Create run — server_default sets status='running'
+    run = IngestionRun(
+        user_id=user_id,
+        source_id=source_id,
+        operation_type="ble_scan",
+        trigger_type="ui_button",
+        idempotency_key=x_idempotency_key,
+        agent_instance_id=agent_instance_id,
+    )
+    db.add(run)
+    await db.flush()
+    run_id = run.id
+
+    # Commit so the subprocess can see the run via its own session
+    await db.commit()
+
+    cmd = [
+        sys.executable, str(script),
+        "--user-id", str(user_id),
+        "--ingestion-run-id", str(run_id),
+    ]
     if height_cm is not None:
         cmd += ["--height-cm", str(height_cm)]
     if birth_date is not None:
@@ -86,18 +174,27 @@ async def scan_scale(
         cmd += ["--sex", str(sex)]
     if mac:
         cmd += ["--mac", mac]
+    if user_device_id is not None:
+        cmd += ["--user-device-id", str(user_device_id)]
+    if agent_instance_id is not None:
+        cmd += ["--agent-instance-id", str(agent_instance_id)]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
     try:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=settings.scale_scan_timeout
         )
     except TimeoutError:
         await _kill_proc(proc)
+        run.status = "failed"
+        run.error_message = f"BLE scan timed out ({settings.scale_scan_timeout}s)"
+        run.finished_at = datetime.now(UTC)
+        await db.commit()
         raise HTTPException(
             status_code=504,
             detail=(
@@ -110,8 +207,15 @@ async def scan_scale(
     errors = stderr.decode(errors="replace")
 
     if proc.returncode == 0:
+        run.status = "completed"
+        run.finished_at = datetime.now(UTC)
+        await db.commit()
         return {"status": "ok", "message": output.strip() or "Import complete"}
 
+    run.status = "failed"
+    run.error_message = _extract_error(errors, output, proc.returncode)[:500]
+    run.finished_at = datetime.now(UTC)
+    await db.commit()
     raise HTTPException(
         status_code=502,
         detail=_extract_error(errors, output, proc.returncode),

@@ -216,6 +216,10 @@ async def ingest(
     user_id: str,
     external_id: str,
     payload_json: dict,
+    *,
+    ingestion_run_id: str | None = None,
+    user_device_id: str | None = None,
+    agent_instance_id: str | None = None,
 ) -> dict:
     """POST the normalised payload to the Baseline ingestion API."""
     body = {
@@ -225,6 +229,12 @@ async def ingest(
         "payload_type": "hc900_scale",
         "payload_json": payload_json,
     }
+    if ingestion_run_id is not None:
+        body["ingestion_run_id"] = ingestion_run_id
+    if user_device_id is not None:
+        body["user_device_id"] = user_device_id
+    if agent_instance_id is not None:
+        body["agent_instance_id"] = agent_instance_id
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(f"{api_url}/api/v1/raw-payloads/ingest", json=body)
         response.raise_for_status()
@@ -324,6 +334,9 @@ async def run(args: argparse.Namespace) -> None:
             user_id=args.user_id,
             external_id=external_id,
             payload_json=payload_json,
+            ingestion_run_id=getattr(args, "ingestion_run_id", None),
+            user_device_id=getattr(args, "user_device_id", None),
+            agent_instance_id=getattr(args, "agent_instance_id", None),
         )
     except httpx.HTTPStatusError as e:
         logger.error("API error %d: %s", e.response.status_code, e.response.text)
@@ -400,6 +413,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Birth date for age-at-measurement derivation",
     )
     g.add_argument("--sex", type=int, choices=[1, 2], metavar="1|2", help="1=male 2=female")
+    p.add_argument(
+        "--ingestion-run-id",
+        default=None,
+        metavar="UUID",
+        help="Link ingested payload to this IngestionRun UUID (set by scan_scale endpoint)",
+    )
+    p.add_argument(
+        "--user-device-id",
+        default=None,
+        metavar="UUID",
+        help="UserDevice UUID to attach to the raw_payload (set by scan_scale endpoint)",
+    )
+    p.add_argument(
+        "--agent-instance-id",
+        default=None,
+        metavar="UUID",
+        help="AgentInstance UUID to attach to the raw_payload (set by scan_scale endpoint)",
+    )
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
     return p
 

@@ -15,6 +15,9 @@ class RawPayloadIngest(BaseModel):
     external_id: str | None = None
     payload_type: str = Field(max_length=63, description="e.g. 'garmin_daily_summary'")
     payload_json: dict[str, Any]
+    ingestion_run_id: uuid.UUID | None = None
+    user_device_id: uuid.UUID | None = None
+    agent_instance_id: uuid.UUID | None = None
 
 
 class RawPayloadResponse(BaseSchema):

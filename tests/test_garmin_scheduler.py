@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import types
+import uuid
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -43,6 +44,27 @@ def fresh_lock(monkeypatch):
 
 
 @pytest.fixture
+def mock_db_ops(monkeypatch):
+    """Stub all scheduler DB operations so _catch_up tests stay DB-free."""
+    async def _source_id():
+        return 1
+
+    async def _create(*_args, **_kwargs):
+        return uuid.uuid4()
+
+    async def _close(*_args, **_kwargs):
+        pass
+
+    async def _cursor(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(mod, "_get_garmin_source_id", _source_id)
+    monkeypatch.setattr(mod, "_create_ingestion_run", _create)
+    monkeypatch.setattr(mod, "_close_ingestion_run", _close)
+    monkeypatch.setattr(mod, "_upsert_source_cursor", _cursor)
+
+
+@pytest.fixture
 def fake_today(monkeypatch):
     """Freeze ``date.today()`` used inside ``_catch_up`` to a known day."""
     fixed = date(2026, 4, 16)
@@ -55,7 +77,7 @@ def fake_today(monkeypatch):
 
 
 async def test_catch_up_refreshes_today_when_already_up_to_date(
-    monkeypatch, fake_today
+    monkeypatch, fake_today, mock_db_ops
 ):
     """Regression: old code returned early; new code re-syncs today."""
     captured: dict = {}
@@ -79,7 +101,7 @@ async def test_catch_up_refreshes_today_when_already_up_to_date(
 
 
 async def test_catch_up_refreshes_today_when_last_is_in_future(
-    monkeypatch, fake_today
+    monkeypatch, fake_today, mock_db_ops
 ):
     """Defensive: if clock drift produced a future last_day, still sync today."""
     captured: dict = {}
@@ -100,7 +122,7 @@ async def test_catch_up_refreshes_today_when_last_is_in_future(
     assert captured["end_date"] == fake_today
 
 
-async def test_catch_up_fresh_user_backfills_seven_days(monkeypatch, fake_today):
+async def test_catch_up_fresh_user_backfills_seven_days(monkeypatch, fake_today, mock_db_ops):
     captured: dict = {}
 
     async def fake_last(_uid):
@@ -119,7 +141,7 @@ async def test_catch_up_fresh_user_backfills_seven_days(monkeypatch, fake_today)
     assert captured["end_date"] == fake_today
 
 
-async def test_catch_up_fills_gap_between_last_and_today(monkeypatch, fake_today):
+async def test_catch_up_fills_gap_between_last_and_today(monkeypatch, fake_today, mock_db_ops):
     captured: dict = {}
 
     async def fake_last(_uid):
@@ -238,7 +260,7 @@ async def test_guarded_catch_up_skips_when_lock_is_held(
     """Tick fires while previous sync still running → log + skip."""
     ran = []
 
-    async def fake_catch_up(uid):
+    async def fake_catch_up(uid, trigger_type="scheduled"):
         ran.append(uid)
 
     monkeypatch.setattr(mod, "_catch_up", fake_catch_up)
@@ -260,7 +282,7 @@ async def test_guarded_catch_up_runs_when_lock_is_free(
 ):
     ran = []
 
-    async def fake_catch_up(uid):
+    async def fake_catch_up(uid, trigger_type="scheduled"):
         ran.append(uid)
 
     monkeypatch.setattr(mod, "_catch_up", fake_catch_up)
@@ -276,7 +298,7 @@ async def test_guarded_catch_up_survives_exception(
     monkeypatch, fresh_lock, caplog
 ):
     """A failing inner call must not propagate; the lock must still release."""
-    async def broken_catch_up(_uid):
+    async def broken_catch_up(_uid, trigger_type="scheduled"):
         raise RuntimeError("network down")
 
     monkeypatch.setattr(mod, "_catch_up", broken_catch_up)
@@ -297,7 +319,7 @@ async def test_guarded_catch_up_serialises_concurrent_calls(
     release_gate = asyncio.Event()
     ran = []
 
-    async def slow_catch_up(uid):
+    async def slow_catch_up(uid, trigger_type="scheduled"):
         in_flight.set()
         await release_gate.wait()
         ran.append(uid)

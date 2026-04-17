@@ -38,7 +38,7 @@ import json
 import logging
 import os
 import sys
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -217,22 +217,31 @@ def build_payload(
     }
 
 
-def build_external_id(date_str: str) -> str:
-    """Deterministic deduplication key: one payload per calendar date.
+def build_external_id(date_str: str, sync_ts: str | None = None) -> str:
+    """Unique key per fetch: logical date + UTC sync timestamp.
 
-    Format: garmin_connect_{YYYY-MM-DD}
+    Format: garmin_connect_{YYYY-MM-DD}_{YYYYMMDDTHHMMSSz}
 
-    Re-syncing the same date returns the existing record without side effects.
-    A date is the natural granularity for Garmin daily summaries — there is
-    exactly one daily summary per day regardless of how many sync runs occur.
+    Each invocation of sync_garmin.py generates one sync_ts shared across all
+    dates in the batch so the run is a coherent unit.  No two fetches produce
+    the same external_id, enabling the parser to replace stale curated data
+    with the latest snapshot for any given date (intraday refresh).
     """
-    return f"garmin_connect_{date_str}"
+    ts = sync_ts or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"garmin_connect_{date_str}_{ts}"
 
 
 # ── Baseline API call ─────────────────────────────────────────────────────────
 
 
-def ingest(api_url: str, user_id: str, external_id: str, payload_json: dict) -> dict:
+def ingest(
+    api_url: str,
+    user_id: str,
+    external_id: str,
+    payload_json: dict,
+    *,
+    ingestion_run_id: str | None = None,
+) -> dict:
     """POST the normalised payload to the Baseline ingestion API."""
     body = {
         "user_id": user_id,
@@ -241,6 +250,8 @@ def ingest(api_url: str, user_id: str, external_id: str, payload_json: dict) -> 
         "payload_type": "garmin_connect_daily",
         "payload_json": payload_json,
     }
+    if ingestion_run_id is not None:
+        body["ingestion_run_id"] = ingestion_run_id
     with httpx.Client(timeout=30) as client:
         response = client.post(f"{api_url}/api/v1/raw-payloads/ingest", json=body)
         response.raise_for_status()
@@ -291,6 +302,10 @@ def run(args: argparse.Namespace) -> None:
 
     logger.info("Syncing %d day(s): %s → %s", len(dates), dates[0], dates[-1])
 
+    # One timestamp shared across all dates — all payloads in this run are
+    # identifiable as a unit via their common sync_ts suffix.
+    sync_ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
     # 3. Garmin Connect login
     logger.info("Logging in to Garmin Connect …")
     try:
@@ -308,7 +323,7 @@ def run(args: argparse.Namespace) -> None:
         payload_json = build_payload(
             date_str, config["user_timezone"], stats, hrv, sleep
         )
-        external_id = build_external_id(date_str)
+        external_id = build_external_id(date_str, sync_ts=sync_ts)
 
         if args.dry_run:
             print(f"\n-- DRY RUN {date_str} {'-' * 46}")
@@ -323,6 +338,7 @@ def run(args: argparse.Namespace) -> None:
                 user_id=args.user_id,
                 external_id=external_id,
                 payload_json=payload_json,
+                ingestion_run_id=args.ingestion_run_id,
             )
         except httpx.HTTPStatusError as e:
             logger.error(
@@ -415,6 +431,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--timezone",
         metavar="TZ",
         help="User timezone for measured_at derivation (e.g. America/Sao_Paulo)",
+    )
+    p.add_argument(
+        "--ingestion-run-id",
+        metavar="UUID",
+        default=None,
+        help="Link ingested payloads to this IngestionRun UUID (set by garmin_scheduler)",
     )
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
     return p

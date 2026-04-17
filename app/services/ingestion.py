@@ -6,6 +6,7 @@ with FK traceability back to the raw payload.
 """
 
 import logging
+import uuid
 from datetime import UTC, date, datetime, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -14,6 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.integrations.hc900 import decode_hc900
 from app.integrations.hc900.decoder import DecodedReading
 from app.integrations.hc900.protocol import hex_to_bytes
+from app.models.ingestion_run import IngestionRun
+from app.models.ingestion_run_payload import IngestionRunPayload
 from app.models.measurement import Measurement
 from app.models.raw_payload import RawPayload
 from app.repositories.lookup import LookupRepository
@@ -32,15 +35,30 @@ class IngestionService:
         self.lookup_repo = LookupRepository(session)
 
     async def ingest(self, data: RawPayloadIngest) -> RawPayload:
-        """Ingest a raw payload: persist it, then attempt to process it into curated data."""
+        """Ingest a raw payload: persist it, then attempt to process it into curated data.
+
+        If ``ingestion_run_id`` is set, the payload is linked to that run via
+        ``ingestion_run_payloads`` in the same transaction. Role is ``"created"``
+        for new payloads and ``"reused"`` when deduplicated by ``external_id``.
+        Run counters are updated accordingly.
+        """
         source = await self.lookup_repo.get_data_source_by_slug(data.source_slug)
         if not source:
             raise ValueError(f"Unknown data source: {data.source_slug}")
+
+        run: IngestionRun | None = None
+        if data.ingestion_run_id is not None:
+            run = await self._validate_and_get_run(
+                data.ingestion_run_id, data.user_id, source.id
+            )
 
         # Deduplicate by external_id
         if data.external_id:
             existing = await self.raw_repo.find_by_external_id(source.id, data.external_id)
             if existing:
+                if run is not None:
+                    await self._link_payload_to_run(existing, run, "reused")
+                    await self.session.commit()
                 return existing
 
         payload = RawPayload(
@@ -49,13 +67,55 @@ class IngestionService:
             external_id=data.external_id,
             payload_type=data.payload_type,
             payload_json=data.payload_json,
+            user_device_id=data.user_device_id,
+            agent_instance_id=data.agent_instance_id,
         )
         await self.raw_repo.create(payload)
+
+        if run is not None:
+            await self._link_payload_to_run(payload, run, "created")
 
         # Attempt processing
         await self._process(payload)
         await self.session.commit()
         return payload
+
+    async def _validate_and_get_run(
+        self,
+        run_id: uuid.UUID,
+        user_id: uuid.UUID,
+        source_id: int,
+    ) -> IngestionRun:
+        """Load and validate an IngestionRun for use in a payload link."""
+        run = await self.session.get(IngestionRun, run_id)
+        if run is None:
+            raise ValueError(f"ingestion_run {run_id} not found")
+        if run.user_id != user_id:
+            raise ValueError("ingestion_run_id belongs to a different user")
+        if run.source_id != source_id:
+            raise ValueError(
+                f"ingestion_run source mismatch: "
+                f"run.source_id={run.source_id}, payload source_id={source_id}"
+            )
+        return run
+
+    async def _link_payload_to_run(
+        self,
+        payload: RawPayload,
+        run: IngestionRun,
+        role: str,
+    ) -> None:
+        """Link a payload to a run; idempotent — skips if link already exists."""
+        existing = await self.session.get(IngestionRunPayload, (run.id, payload.id))
+        if existing is not None:
+            return
+
+        self.session.add(IngestionRunPayload(run_id=run.id, payload_id=payload.id, role=role))
+
+        if role == "created":
+            run.raw_payloads_created += 1
+        elif role == "reused":
+            run.raw_payloads_reused += 1
 
     async def _process(self, payload: RawPayload) -> None:
         """Route to the appropriate parser based on payload_type.
@@ -382,6 +442,18 @@ class IngestionService:
             raise ValueError(
                 "Data source 'garmin_connect' not found. Run: alembic upgrade head"
             )
+
+        # Replace measurements from any prior snapshot for this logical date.
+        # raw_payloads is append-only; each re-sync creates a new versioned row.
+        # The curated layer always reflects the latest snapshot so intraday
+        # updates (body battery, stress, HRV, sleep score) land on every refresh.
+        # If this parse fails the savepoint rolls back, leaving prior data intact.
+        await self.measurement_repo.delete_for_garmin_daily_snapshot(
+            user_id=payload.user_id,
+            source_id=source.id,
+            logical_date=date_str,
+            current_raw_payload_id=payload.id,
+        )
 
         stats = data.get("stats") or {}
         hrv_data = data.get("hrv") or {}

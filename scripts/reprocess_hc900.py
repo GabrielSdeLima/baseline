@@ -4,11 +4,14 @@ Re-runs the current HC900 parser (``hc900_ble_v2``) over already-ingested
 ``hc900_scale`` raw_payloads for a given user and date range.  For each
 payload in scope, this:
 
-    1. Deletes every ``measurements`` row with ``raw_payload_id = <id>``.
-    2. Invokes :meth:`IngestionService._parse_hc900_scale` on the payload,
+    1. Checks idempotency: skips if a completed IngestionRun already exists
+       for this payload (override with ``--force``).
+    2. Deletes every ``measurements`` row with ``raw_payload_id = <id>``.
+    3. Invokes :meth:`IngestionService._parse_hc900_scale` on the payload,
        which re-decodes from the preserved ``raw_mfr_*_hex`` bytes and
        re-inserts the full 18-metric set using the latest formulas.
-    3. Updates the payload's ``processing_status``/``processed_at``.
+    4. Creates an IngestionRun (``operation_type=replay``) and links the
+       payload with ``role='reprocessed'``.
 
 Raw bytes (``raw_mfr_weight_hex`` / ``raw_mfr_impedance_hex``) are NEVER
 touched — they are the source of truth that makes this operation safe.
@@ -34,6 +37,10 @@ Usage
     # destructively rewrite
     python scripts/reprocess_hc900.py --user-id <UUID> \\
         --start 2026-04-01 --end 2026-04-16 --execute
+
+    # force re-run even already-reprocessed payloads
+    python scripts/reprocess_hc900.py --user-id <UUID> \\
+        --start 2026-04-01 --end 2026-04-16 --execute --force
 """
 
 from __future__ import annotations
@@ -42,7 +49,7 @@ import argparse
 import asyncio
 import logging
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 from uuid import UUID
 
 from sqlalchemy import Date, cast, delete, func, select
@@ -51,6 +58,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import async_session
 from app.models.data_source import DataSource
+from app.models.ingestion_run import IngestionRun
+from app.models.ingestion_run_payload import IngestionRunPayload
 from app.models.measurement import Measurement
 from app.models.raw_payload import RawPayload
 from app.services.ingestion import IngestionService
@@ -116,13 +125,19 @@ async def reprocess_one(
     session: AsyncSession,
     service: IngestionService,
     payload: RawPayload,
+    source_id: int,
     *,
     dry_run: bool,
+    force: bool = False,
 ) -> dict:
     """Reprocess a single payload. Returns a summary dict for logging.
 
     With ``dry_run=True`` this only counts current measurements and does
     NOT delete, re-decode or re-insert — callers get a preview of scope.
+
+    In execute mode, creates a per-payload IngestionRun (operation_type=replay)
+    and links the payload with role='reprocessed'.  Skips without --force if a
+    completed run for this payload already exists.
     """
     before = await count_measurements_for(session, payload.id)
     measured_at = payload.payload_json.get("measured_at", "?")
@@ -142,13 +157,38 @@ async def reprocess_one(
         summary["action"] = "preview"
         return summary
 
-    # Destructive path: delete curated rows, then re-parse from raw bytes.
+    # Idempotency: skip if a completed replay run already exists for this payload
+    idempotency_key = f"hc900:reprocess:{payload.user_id}:{payload.id}"
+    existing_run = await session.scalar(
+        select(IngestionRun).where(IngestionRun.idempotency_key == idempotency_key)
+    )
+    if existing_run is not None:
+        if existing_run.status == "completed" and not force:
+            summary["action"] = "skipped"
+            summary["reason"] = "already reprocessed; pass --force to override"
+            summary["run_id"] = str(existing_run.id)
+            return summary
+        # completed+force or failed → release the key so the new run may claim it
+        existing_run.idempotency_key = None
+        await session.flush()
+
+    # Create a per-payload IngestionRun
+    run = IngestionRun(
+        user_id=payload.user_id,
+        source_id=source_id,
+        operation_type="replay",
+        trigger_type="manual",
+        idempotency_key=idempotency_key,
+    )
+    session.add(run)
+    await session.flush()
+
+    # Delete curated rows, re-parse from raw bytes
     await session.execute(
         delete(Measurement).where(Measurement.raw_payload_id == payload.id)
     )
     await session.flush()
 
-    # Reset status so _process doesn't short-circuit on "already has data".
     payload.processing_status = "pending"
     payload.processed_at = None
     payload.error_message = None
@@ -158,9 +198,29 @@ async def reprocess_one(
     await session.flush()
 
     after = await count_measurements_for(session, payload.id)
+
+    # Populate counters and close run
+    run.measurements_deleted = before
+    run.measurements_created = after
+    run.finished_at = datetime.now(UTC)
+
+    if payload.processing_status == "processed":
+        run.status = "completed"
+    else:
+        run.status = "failed"
+        run.raw_payloads_failed = 1
+        run.error_message = payload.error_message
+
+    # Link payload to this run
+    session.add(
+        IngestionRunPayload(run_id=run.id, payload_id=payload.id, role="reprocessed")
+    )
+    await session.flush()
+
     summary["action"] = "reprocessed"
     summary["after"] = after
     summary["new_status"] = payload.processing_status
+    summary["run_id"] = str(run.id)
     if payload.processing_status == "failed":
         summary["error"] = payload.error_message
     return summary
@@ -188,12 +248,14 @@ async def run(args: argparse.Namespace) -> int:
         return 2
 
     mode = "EXECUTE" if args.execute else "DRY-RUN"
+    force = getattr(args, "force", False)
     logger.info(
-        "[%s] Reprocessing hc900_ble payloads for user=%s range=%s..%s",
+        "[%s] Reprocessing hc900_ble payloads for user=%s range=%s..%s%s",
         mode,
         user_id,
         start,
         end,
+        " (--force)" if force else "",
     )
 
     async with async_session() as session:
@@ -202,39 +264,51 @@ async def run(args: argparse.Namespace) -> int:
         if not payloads:
             return 0
 
+        # Look up source_id once — shared across all per-payload runs
+        source_id = await session.scalar(
+            select(DataSource.id).where(DataSource.slug == _SOURCE_SLUG)
+        )
+
         service = IngestionService(session)
         summaries: list[dict] = []
 
         try:
             for p in payloads:
-                s = await reprocess_one(session, service, p, dry_run=not args.execute)
+                s = await reprocess_one(
+                    session, service, p, source_id,
+                    dry_run=not args.execute,
+                    force=force,
+                )
                 summaries.append(s)
-                if args.execute:
+                action = s.get("action", "?")
+                if action == "preview":
+                    logger.info(
+                        "  %s  %s  current_measurements=%d  prior_decoder=%s  status=%s",
+                        s["measured_at"], s["payload_id"],
+                        s["before"], s["prior_decoder_version"], s["prior_status"],
+                    )
+                elif action == "skipped":
+                    logger.info(
+                        "  SKIP  %s  %s  reason=%s",
+                        s["measured_at"], s["payload_id"], s.get("reason", ""),
+                    )
+                else:
                     logger.info(
                         "  %s  %s  before=%d  after=%d  status=%s  prior=%s",
-                        s["measured_at"],
-                        s["payload_id"],
-                        s["before"],
-                        s["after"],
-                        s["new_status"],
-                        s["prior_decoder_version"],
+                        s["measured_at"], s["payload_id"],
+                        s["before"], s["after"],
+                        s["new_status"], s["prior_decoder_version"],
                     )
                     if "error" in s:
                         logger.error("    error: %s", s["error"])
-                else:
-                    logger.info(
-                        "  %s  %s  current_measurements=%d  prior_decoder=%s  status=%s",
-                        s["measured_at"],
-                        s["payload_id"],
-                        s["before"],
-                        s["prior_decoder_version"],
-                        s["prior_status"],
-                    )
 
             if args.execute:
                 await session.commit()
+                executed = [s for s in summaries if s.get("action") == "reprocessed"]
+                skipped = [s for s in summaries if s.get("action") == "skipped"]
                 logger.info(
-                    "COMMITTED — %d payload(s) reprocessed.", len(summaries)
+                    "COMMITTED — %d reprocessed, %d skipped.",
+                    len(executed), len(skipped),
                 )
             else:
                 logger.info(
@@ -284,6 +358,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--execute", action="store_true",
         help="Actually delete and re-insert. Without this, runs in dry-run mode.",
+    )
+    p.add_argument(
+        "--force", action="store_true",
+        help="Override idempotency: re-run even payloads already reprocessed.",
     )
     p.add_argument("--debug", action="store_true", help="Enable debug logging.")
     return p

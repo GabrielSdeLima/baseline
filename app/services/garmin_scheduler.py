@@ -25,6 +25,10 @@ Behaviour
    If a tick fires while the previous sync is still running (slow network,
    long backfill) the new tick logs a skip and waits for the next cycle.
 
+5. **Operational traceability**: each sync creates an ``IngestionRun`` before
+   launching the subprocess and closes it as completed/failed afterward.
+   A ``SourceCursor`` for ``daily_summary`` is upserted on every successful run.
+
 Graceful degradation
 --------------------
 If prerequisites are missing the scheduler logs a single info line and exits
@@ -45,13 +49,16 @@ import logging
 import sys
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.core.config import settings
 from app.core.database import async_session
+from app.models.data_source import DataSource
+from app.models.ingestion_run import IngestionRun
+from app.models.source_cursor import SourceCursor
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +88,11 @@ def _get_sync_lock() -> asyncio.Lock:
     return _sync_lock
 
 
+# ---------------------------------------------------------------------------
+# DB helpers — each opens its own session (scheduler runs outside request ctx)
+# ---------------------------------------------------------------------------
+
+
 async def _last_garmin_day(user_id: uuid.UUID) -> date | None:
     """Return the most recent ``measured_at`` date for any Garmin measurement."""
     async with async_session() as db:
@@ -98,12 +110,102 @@ async def _last_garmin_day(user_id: uuid.UUID) -> date | None:
         return result.scalar()
 
 
+async def _get_garmin_source_id() -> int | None:
+    """Return the PK of the garmin_connect data source, or None if not seeded."""
+    async with async_session() as db:
+        result = await db.execute(
+            select(DataSource.id).where(DataSource.slug == "garmin_connect")
+        )
+        return result.scalar_one_or_none()
+
+
+async def _create_ingestion_run(
+    user_id: uuid.UUID,
+    source_id: int,
+    trigger_type: str,
+    idempotency_key: str | None,
+) -> uuid.UUID:
+    """Insert an IngestionRun with status='running' and return its ID."""
+    async with async_session() as db:
+        run = IngestionRun(
+            user_id=user_id,
+            source_id=source_id,
+            operation_type="cloud_sync",
+            trigger_type=trigger_type,
+            idempotency_key=idempotency_key,
+        )
+        db.add(run)
+        await db.flush()
+        run_id = run.id
+        await db.commit()
+        return run_id
+
+
+async def _close_ingestion_run(
+    run_id: uuid.UUID,
+    status: str,
+    error_message: str | None = None,
+) -> None:
+    """Update a run's status and finished_at."""
+    async with async_session() as db:
+        run = await db.get(IngestionRun, run_id)
+        if run is None:
+            return
+        run.status = status
+        run.finished_at = datetime.now(UTC)
+        if error_message:
+            run.error_message = error_message
+        await db.commit()
+
+
+async def _upsert_source_cursor(
+    user_id: uuid.UUID,
+    source_id: int,
+    logical_date: date,
+    run_id: uuid.UUID,
+) -> None:
+    """Create or advance the garmin_connect daily_summary source cursor."""
+    async with async_session() as db:
+        result = await db.execute(
+            select(SourceCursor).where(
+                SourceCursor.user_id == user_id,
+                SourceCursor.source_id == source_id,
+                SourceCursor.cursor_name == "daily_summary",
+                SourceCursor.cursor_scope_key == "",
+            )
+        )
+        cursor = result.scalar_one_or_none()
+        now = datetime.now(UTC)
+        if cursor is not None:
+            cursor.cursor_value_json = {"date": logical_date.isoformat()}
+            cursor.last_successful_run_id = run_id
+            cursor.last_advanced_at = now
+            cursor.updated_at = now
+        else:
+            db.add(SourceCursor(
+                user_id=user_id,
+                source_id=source_id,
+                cursor_name="daily_summary",
+                cursor_scope_key="",
+                cursor_value_json={"date": logical_date.isoformat()},
+                last_successful_run_id=run_id,
+                last_advanced_at=now,
+            ))
+        await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Subprocess launcher
+# ---------------------------------------------------------------------------
+
+
 async def _run_sync(
     user_id: str,
     *,
     days: int | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    ingestion_run_id: str | None = None,
 ) -> int:
     """Invoke ``scripts/sync_garmin.py`` as a subprocess.  Returns the exit code."""
     args: list[str] = [sys.executable, str(_SYNC_SCRIPT), "--user-id", user_id]
@@ -111,6 +213,8 @@ async def _run_sync(
         args += ["--days", str(days)]
     if start_date is not None and end_date is not None:
         args += ["--start-date", start_date.isoformat(), "--end-date", end_date.isoformat()]
+    if ingestion_run_id is not None:
+        args += ["--ingestion-run-id", ingestion_run_id]
 
     logger.info("[garmin-sync] launching: %s", " ".join(args[1:]))
     proc = await asyncio.create_subprocess_exec(
@@ -128,12 +232,23 @@ async def _run_sync(
     return rc
 
 
-async def _catch_up(user_id_str: str) -> None:
+# ---------------------------------------------------------------------------
+# Catch-up logic
+# ---------------------------------------------------------------------------
+
+
+async def _catch_up(user_id_str: str, trigger_type: str = "scheduled") -> None:
     """Backfill the gap between the last Garmin measurement and today.
+
+    Creates an IngestionRun before launching sync_garmin.py and closes it
+    as completed/failed after the subprocess returns.  Advances the
+    daily_summary source cursor on success.
 
     When ``last_day >= today`` the function still re-syncs today so the
     intraday updates Garmin Connect publishes later (body battery, stress,
-    steps, sleep score, HRV) are captured — the sync script is idempotent.
+    steps, sleep score, HRV) are captured.  Each re-sync creates a new
+    versioned raw_payload; the parser replaces curated measurements for that
+    logical date with data from the latest snapshot.
     """
     try:
         uid = uuid.UUID(user_id_str)
@@ -145,23 +260,59 @@ async def _catch_up(user_id_str: str) -> None:
 
     today = date.today()
     last_day = await _last_garmin_day(uid)
+
     if last_day is None:
+        effective_trigger = "backfill"
         start = today - timedelta(days=_INITIAL_BACKFILL_DAYS)
         logger.info(
             "[garmin-sync] no prior Garmin data — backfilling %d days from %s",
             _INITIAL_BACKFILL_DAYS, start,
         )
     elif last_day >= today:
+        effective_trigger = trigger_type
         start = today
         logger.info("[garmin-sync] refreshing today (last=%s)", last_day)
     else:
+        effective_trigger = trigger_type
         start = last_day + timedelta(days=1)
         logger.info("[garmin-sync] catch-up from %s to %s", start, today)
 
-    await _run_sync(user_id_str, start_date=start, end_date=today)
+    # Backfills are idempotent by date range so the same 7-day seed is never
+    # doubled.  Scheduled/wake/startup refreshes use a null key — a completed
+    # run must never block today's legitimate intraday refresh.
+    idempotency_key: str | None = (
+        f"garmin:backfill:{uid}:{start.isoformat()}:{today.isoformat()}"
+        if effective_trigger == "backfill"
+        else None
+    )
+
+    source_id = await _get_garmin_source_id()
+    if source_id is None:
+        logger.error(
+            "[garmin-sync] garmin_connect data source not found — run: alembic upgrade head"
+        )
+        return
+
+    run_id = await _create_ingestion_run(uid, source_id, effective_trigger, idempotency_key)
+
+    rc = await _run_sync(
+        user_id_str,
+        start_date=start,
+        end_date=today,
+        ingestion_run_id=str(run_id),
+    )
+
+    if rc == 0:
+        await _close_ingestion_run(run_id, "completed")
+        await _upsert_source_cursor(uid, source_id, today, run_id)
+    else:
+        await _close_ingestion_run(
+            run_id, "failed",
+            error_message=f"sync_garmin.py exited rc={rc}",
+        )
 
 
-async def _guarded_catch_up(user_id: str) -> bool:
+async def _guarded_catch_up(user_id: str, trigger_type: str = "scheduled") -> bool:
     """Run ``_catch_up`` under the anti-overlap lock.
 
     Returns True if the catch-up ran (even if the inner call failed), False
@@ -177,7 +328,7 @@ async def _guarded_catch_up(user_id: str) -> bool:
         return False
     async with lock:
         try:
-            await _catch_up(user_id)
+            await _catch_up(user_id, trigger_type)
         except Exception:
             logger.exception("[garmin-sync] sync failed; will retry next cycle")
     return True
@@ -249,12 +400,13 @@ async def run_scheduler() -> None:
     )
 
     try:
-        await _guarded_catch_up(user_id)
+        await _guarded_catch_up(user_id, trigger_type="startup")
         while True:
             woke = await _wake_aware_sleep(interval_s)
+            current_trigger = "wake" if woke else "scheduled"
             if woke:
                 logger.info("[garmin-sync] running catch-up after wake")
-            await _guarded_catch_up(user_id)
+            await _guarded_catch_up(user_id, trigger_type=current_trigger)
     except asyncio.CancelledError:
         logger.info("[garmin-sync] scheduler stopped")
         raise

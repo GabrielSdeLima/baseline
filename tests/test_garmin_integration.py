@@ -347,47 +347,107 @@ class TestGarminNullSafety:
         assert count == 0
 
 
-# ── D. Deduplication ─────────────────────────────────────────────────────────
+# ── D. Versioned snapshots (Option B — append-only re-sync) ──────────────────
 
 
-class TestGarminDeduplication:
-    async def test_same_date_returns_same_record(
+class TestGarminVersionedSnapshots:
+    async def test_resync_same_date_creates_new_raw_payload(
         self, db: AsyncSession, user: User
     ):
-        """Re-ingesting the same date returns the existing record unchanged."""
+        """Each re-sync of the same date creates a distinct versioned raw_payload."""
         svc = IngestionService(db)
-        first = await svc.ingest(_ingest_request(user, _FULL_PAYLOAD_JSON))
-        second = await svc.ingest(_ingest_request(user, _FULL_PAYLOAD_JSON))
-        assert first.id == second.id
+        p1 = await svc.ingest(_ingest_request(
+            user, _FULL_PAYLOAD_JSON,
+            external_id="garmin_connect_2026-04-15_20260415T080000Z",
+        ))
+        p2 = await svc.ingest(_ingest_request(
+            user, _FULL_PAYLOAD_JSON,
+            external_id="garmin_connect_2026-04-15_20260415T200000Z",
+        ))
+        assert p1.id != p2.id
 
-    async def test_same_date_no_extra_raw_payload(
+    async def test_snapshot_replaces_measurements_for_same_date(
         self, db: AsyncSession, user: User
     ):
-        """Exactly one raw_payload per external_id after two ingests."""
+        """After re-sync, all curated measurements for that date belong to the new snapshot."""
         svc = IngestionService(db)
-        await svc.ingest(_ingest_request(user, _FULL_PAYLOAD_JSON))
-        await svc.ingest(_ingest_request(user, _FULL_PAYLOAD_JSON))
+        await svc.ingest(_ingest_request(
+            user, _FULL_PAYLOAD_JSON,
+            external_id="garmin_connect_2026-04-15_20260415T080000Z",
+        ))
+        p2 = await svc.ingest(_ingest_request(
+            user, _FULL_PAYLOAD_JSON,
+            external_id="garmin_connect_2026-04-15_20260415T200000Z",
+        ))
+        result = await db.execute(
+            select(Measurement).where(Measurement.raw_payload_id == p2.id)
+        )
+        assert len(list(result.scalars())) == 10
 
+    async def test_prior_raw_payload_preserved(
+        self, db: AsyncSession, user: User
+    ):
+        """Old raw_payload is NOT deleted after re-sync — append-only audit trail."""
+        svc = IngestionService(db)
+        p1 = await svc.ingest(_ingest_request(
+            user, _FULL_PAYLOAD_JSON,
+            external_id="garmin_connect_2026-04-15_20260415T080000Z",
+        ))
+        await svc.ingest(_ingest_request(
+            user, _FULL_PAYLOAD_JSON,
+            external_id="garmin_connect_2026-04-15_20260415T200000Z",
+        ))
+        raw = await db.get(RawPayload, p1.id)
+        assert raw is not None
+
+    async def test_old_measurements_removed_after_resync(
+        self, db: AsyncSession, user: User
+    ):
+        """Prior snapshot's measurements are removed when a newer snapshot is processed."""
+        svc = IngestionService(db)
+        p1 = await svc.ingest(_ingest_request(
+            user, _FULL_PAYLOAD_JSON,
+            external_id="garmin_connect_2026-04-15_20260415T080000Z",
+        ))
+        await svc.ingest(_ingest_request(
+            user, _FULL_PAYLOAD_JSON,
+            external_id="garmin_connect_2026-04-15_20260415T200000Z",
+        ))
         count = await db.scalar(
             select(func.count())
-            .select_from(RawPayload)
-            .where(RawPayload.external_id == _EXTERNAL_ID)
+            .select_from(Measurement)
+            .where(Measurement.raw_payload_id == p1.id)
         )
-        assert count == 1
+        assert count == 0
+
+    async def test_same_external_id_still_deduplicates(
+        self, db: AsyncSession, user: User
+    ):
+        """Identical external_id submitted twice (network retry) → single raw_payload."""
+        svc = IngestionService(db)
+        p1 = await svc.ingest(_ingest_request(
+            user, _FULL_PAYLOAD_JSON,
+            external_id="garmin_connect_2026-04-15_20260415T080000Z",
+        ))
+        p2 = await svc.ingest(_ingest_request(
+            user, _FULL_PAYLOAD_JSON,
+            external_id="garmin_connect_2026-04-15_20260415T080000Z",
+        ))
+        assert p1.id == p2.id
 
     async def test_different_dates_are_independent(
         self, db: AsyncSession, user: User
     ):
         """Two different dates produce two independent raw_payloads."""
         svc = IngestionService(db)
-        p1_json = {**_FULL_PAYLOAD_JSON, "date": "2026-04-14"}
-        p2_json = {**_FULL_PAYLOAD_JSON, "date": "2026-04-15"}
-        p1 = await svc.ingest(
-            _ingest_request(user, p1_json, external_id="garmin_connect_2026-04-14")
-        )
-        p2 = await svc.ingest(
-            _ingest_request(user, p2_json, external_id="garmin_connect_2026-04-15")
-        )
+        p1 = await svc.ingest(_ingest_request(
+            user, {**_FULL_PAYLOAD_JSON, "date": "2026-04-14"},
+            external_id="garmin_connect_2026-04-14_20260415T080000Z",
+        ))
+        p2 = await svc.ingest(_ingest_request(
+            user, {**_FULL_PAYLOAD_JSON, "date": "2026-04-15"},
+            external_id="garmin_connect_2026-04-15_20260415T080000Z",
+        ))
         assert p1.id != p2.id
 
 
@@ -450,8 +510,14 @@ class TestSyncHelpers:
     def test_build_external_id_format(self):
         from sync_garmin import build_external_id
 
-        assert build_external_id("2026-04-15") == "garmin_connect_2026-04-15"
-        assert build_external_id("2026-01-01") == "garmin_connect_2026-01-01"
+        # Explicit sync_ts → deterministic result
+        result = build_external_id("2026-04-15", sync_ts="20260415T120000Z")
+        assert result == "garmin_connect_2026-04-15_20260415T120000Z"
+
+        # Auto sync_ts: prefix correct, length matches the fixed format
+        auto = build_external_id("2026-01-01")
+        assert auto.startswith("garmin_connect_2026-01-01_")
+        assert len(auto) == len("garmin_connect_2026-01-01_20260101T120000Z")
 
     def test_date_range_consecutive(self):
         from sync_garmin import date_range
