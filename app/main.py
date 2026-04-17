@@ -8,9 +8,13 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
+from app.core.logging_config import configure_logging
 from app.services.garmin_scheduler import run_scheduler
 
+_LOG_FILE = configure_logging()
+
 _logger = logging.getLogger(__name__)
+_logger.info("[startup] logging to %s (daily rotation, 14-day retention)", _LOG_FILE)
 
 
 @asynccontextmanager

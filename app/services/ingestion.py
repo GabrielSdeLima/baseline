@@ -5,17 +5,23 @@ parsers that extract curated records (measurements, workouts, etc.)
 with FK traceability back to the raw payload.
 """
 
+import logging
 from datetime import UTC, date, datetime, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.integrations.hc900 import decode_hc900
+from app.integrations.hc900.decoder import DecodedReading
+from app.integrations.hc900.protocol import hex_to_bytes
 from app.models.measurement import Measurement
 from app.models.raw_payload import RawPayload
 from app.repositories.lookup import LookupRepository
 from app.repositories.measurement import MeasurementRepository
 from app.repositories.raw_payload import RawPayloadRepository
 from app.schemas.raw_payload import RawPayloadIngest
+
+logger = logging.getLogger(__name__)
 
 
 class IngestionService:
@@ -176,36 +182,35 @@ class IngestionService:
         await self.measurement_repo.create(measurement)
 
     async def _parse_hc900_scale(self, payload: RawPayload) -> None:
-        """Extract weight and body-fat measurements from an HC900 BLE scale payload.
+        """Extract all HC900 scale measurements from a raw payload.
 
-        Expected payload_json structure (produced by scripts/import_scale.py):
-        {
-            "format_version": "hc900_ble_v1",
-            "device_mac":     "A0:91:5C:92:CF:17",
-            "captured_at":    "2026-04-15T07:30:15Z",
-            "measured_at":    "2026-04-15T07:30:15Z",
-            "capture_method": "bleak_scan",
-            "raw_mfr_weight_hex":    "...",
-            "raw_mfr_impedance_hex": "...",   // optional
-            "decoded": {
-                "weight_kg":    74.8,
-                "body_fat_pct": 18.3,         // optional — only when impedance captured
-                "impedance_adc": 47450,       // optional
-                "muscle_pct":   62.5,         // optional
-                "bone_mass_kg": 3.2,          // optional
-                "water_pct":    60.1,         // optional
-                "bmr":          1820,         // optional
-                "decoder_version": "hc900_ble_v1"
-            },
-            "user_profile_snapshot": {"height_cm": 175, "age": 30, "sex": 1}
-        }
+        The parser re-decodes from the stored raw bytes
+        (``raw_mfr_weight_hex`` / ``raw_mfr_impedance_hex``) whenever they're
+        present, so re-running this over a v1 payload produces the full v2
+        metric set.  If raw bytes are missing (shouldn't happen for scanner
+        output, but possible for hand-crafted payloads), it falls back to
+        the already-decoded dict at ``payload_json['decoded']`` and persists
+        only the subset of fields that are present — never fabricating
+        values.
 
-        Persists measurements for:
-          - weight (always present)
-          - body_fat_pct (only when decoded.body_fat_pct is present)
+        Metrics emitted (18 total):
+
+        Primary (is_derived=false, 2):
+            weight, impedance_adc
+
+        Derived, impedance-independent (is_derived=true, 2):
+            bmi, bmr  — computed from weight + profile; persisted even on
+            weight-only readings.
+
+        Derived, impedance-dependent (is_derived=true, 14):
+            body_fat_pct, fat_free_mass_kg, fat_mass_kg,
+            skeletal_muscle_mass_kg, skeletal_muscle_pct,
+            muscle_mass_kg, muscle_pct,
+            water_mass_kg, water_pct,
+            protein_mass_kg, protein_pct,
+            bone_mass_kg, ffmi, fmi.
         """
         data = payload.payload_json
-        decoded = data.get("decoded", {})
         measured_at = datetime.fromisoformat(data["measured_at"])
 
         source = await self.lookup_repo.get_data_source_by_slug("hc900_ble")
@@ -214,19 +219,19 @@ class IngestionService:
                 "Data source 'hc900_ble' not found. Run: alembic upgrade head"
             )
 
-        # V1 scope: weight + body_fat_pct only.
-        metrics_map = {
-            "weight_kg": ("weight", "kg"),
-            "body_fat_pct": ("body_fat_pct", "%"),
-        }
+        values = self._extract_hc900_metrics(data)
 
-        measurements = []
-        for decoded_key, (metric_slug, unit) in metrics_map.items():
-            value = decoded.get(decoded_key)
+        measurements: list[Measurement] = []
+        for metric_slug, (value, unit, is_derived) in values.items():
             if value is None:
                 continue
             metric_type = await self.lookup_repo.get_metric_type_by_slug(metric_slug)
             if not metric_type:
+                logger.warning(
+                    "[hc900] metric_type %r not in DB — skipping. "
+                    "Run: alembic upgrade head",
+                    metric_slug,
+                )
                 continue
             measurements.append(
                 Measurement(
@@ -238,12 +243,93 @@ class IngestionService:
                     measured_at=measured_at,
                     recorded_at=payload.ingested_at,
                     aggregation_level="spot",
+                    is_derived=is_derived,
                     raw_payload_id=payload.id,
                 )
             )
 
         if measurements:
             await self.measurement_repo.create_many(measurements)
+
+    @staticmethod
+    def _extract_hc900_metrics(
+        data: dict,
+    ) -> dict[str, tuple[float | int | None, str, bool]]:
+        """Resolve the 18-metric map for an HC900 payload.
+
+        Returns a dict keyed by metric_type slug with tuples of
+        ``(value, unit, is_derived)``.  Values are None when the underlying
+        reading doesn't support them (e.g., no impedance → body_fat_pct is None).
+
+        Prefers re-decoding from raw bytes (source of truth) and falls back
+        to the pre-decoded dict when raw bytes are absent.
+        """
+        decoded = IngestionService._decoded_view(data)
+        return {
+            # Primary
+            "weight": (decoded.get("weight_kg"), "kg", False),
+            "impedance_adc": (decoded.get("impedance_adc"), "adc", False),
+            # Derived — impedance-independent
+            "bmi": (decoded.get("bmi"), "kg/m²", True),
+            "bmr": (decoded.get("bmr"), "kcal", True),
+            # Derived — impedance-dependent
+            "body_fat_pct": (decoded.get("body_fat_pct"), "%", True),
+            "fat_free_mass_kg": (decoded.get("fat_free_mass_kg"), "kg", True),
+            "fat_mass_kg": (decoded.get("fat_mass_kg"), "kg", True),
+            "skeletal_muscle_mass_kg": (
+                decoded.get("skeletal_muscle_mass_kg"),
+                "kg",
+                True,
+            ),
+            "skeletal_muscle_pct": (decoded.get("skeletal_muscle_pct"), "%", True),
+            "muscle_mass_kg": (decoded.get("muscle_mass_kg"), "kg", True),
+            "muscle_pct": (decoded.get("muscle_pct"), "%", True),
+            "water_mass_kg": (decoded.get("water_mass_kg"), "kg", True),
+            "water_pct": (decoded.get("water_pct"), "%", True),
+            "protein_mass_kg": (decoded.get("protein_mass_kg"), "kg", True),
+            "protein_pct": (decoded.get("protein_pct"), "%", True),
+            "bone_mass_kg": (decoded.get("bone_mass_kg"), "kg", True),
+            "ffmi": (decoded.get("ffmi"), "kg/m²", True),
+            "fmi": (decoded.get("fmi"), "kg/m²", True),
+        }
+
+    @staticmethod
+    def _decoded_view(data: dict) -> dict:
+        """Return the 18-field decoded dict, preferring a live re-decode.
+
+        Raw hex bytes are the source of truth.  When present, we re-run
+        ``decode_hc900`` so v1 payloads pick up every v2 field.  Profile is
+        taken from the ``user_profile_snapshot`` on the payload itself (the
+        snapshot frozen at capture time).  When hex is absent we fall back
+        to the stored decoded dict — the parser will persist only the
+        fields that exist there without inventing anything.
+        """
+        hex_weight = data.get("raw_mfr_weight_hex")
+        hex_imp = data.get("raw_mfr_impedance_hex")
+        if not hex_weight:
+            return dict(data.get("decoded") or {})
+
+        profile = data.get("user_profile_snapshot") or {}
+        height_cm = profile.get("height_cm")
+        age = profile.get("age")
+        sex = profile.get("sex")
+
+        try:
+            reading: DecodedReading = decode_hc900(
+                hex_to_bytes(hex_weight),
+                hex_to_bytes(hex_imp) if hex_imp else None,
+                height_cm=height_cm,
+                age=age,
+                sex=sex,
+            )
+        except ValueError as e:
+            # Malformed bytes or profile missing when impedance is present.
+            # Surface via logger and fall back to whatever is in 'decoded';
+            # the parser won't fabricate values for missing fields.
+            logger.warning("[hc900] re-decode failed, using stored decoded: %s", e)
+            return dict(data.get("decoded") or {})
+
+        return reading.to_dict()
 
     async def _parse_garmin_connect_daily(self, payload: RawPayload) -> None:
         """Extract daily health metrics from a Garmin Connect daily summary payload.

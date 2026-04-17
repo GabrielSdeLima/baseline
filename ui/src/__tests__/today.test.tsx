@@ -18,6 +18,7 @@ vi.mock('../api/client', async () => {
     fetchMedicationAdherence: vi.fn(),
     fetchMeasurements: vi.fn(),
     fetchCheckpoints: vi.fn(),
+    fetchLatestScaleReading: vi.fn(),
     fetchIllnessSignal: vi.fn(),
     fetchRecoveryStatus: vi.fn(),
     fetchSymptomLogs: vi.fn(),
@@ -60,6 +61,15 @@ const defaultAdherence = {
 
 const emptyList = { items: [], total: 0, offset: 0, limit: 1 };
 
+const neverMeasuredScale = {
+  status: 'never_measured' as const,
+  measured_at: null,
+  raw_payload_id: null,
+  decoder_version: null,
+  has_impedance: false,
+  metrics: {},
+};
+
 function renderToday() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -77,6 +87,7 @@ describe('Today — Symptom Burden (B1)', () => {
     vi.mocked(client.fetchMedicationAdherence).mockResolvedValue(defaultAdherence);
     vi.mocked(client.fetchMeasurements).mockResolvedValue({ ...emptyList, total: 10 });
     vi.mocked(client.fetchCheckpoints).mockResolvedValue({ items: [], total: 0, offset: 0, limit: 14 });
+    vi.mocked(client.fetchLatestScaleReading).mockResolvedValue(neverMeasuredScale);
   });
 
   afterEach(() => vi.clearAllMocks());
@@ -106,6 +117,7 @@ describe('Today — Medication Adherence (B2)', () => {
     vi.mocked(client.fetchDeviations).mockResolvedValue(defaultDeviations);
     vi.mocked(client.fetchMeasurements).mockResolvedValue({ ...emptyList, total: 10 });
     vi.mocked(client.fetchCheckpoints).mockResolvedValue({ items: [], total: 0, offset: 0, limit: 14 });
+    vi.mocked(client.fetchLatestScaleReading).mockResolvedValue(neverMeasuredScale);
   });
 
   afterEach(() => vi.clearAllMocks());
@@ -143,6 +155,7 @@ describe('Today — Deviations / Baseline Forming (A3)', () => {
     vi.mocked(client.fetchDeviations).mockResolvedValue(defaultDeviations);
     vi.mocked(client.fetchMedicationAdherence).mockResolvedValue(defaultAdherence);
     vi.mocked(client.fetchCheckpoints).mockResolvedValue({ items: [], total: 0, offset: 0, limit: 14 });
+    vi.mocked(client.fetchLatestScaleReading).mockResolvedValue(neverMeasuredScale);
   });
 
   afterEach(() => vi.clearAllMocks());
@@ -193,6 +206,7 @@ describe('Today — FreshnessBar (A2)', () => {
     vi.mocked(client.fetchMedicationAdherence).mockResolvedValue(defaultAdherence);
     vi.mocked(client.fetchMeasurements).mockResolvedValue({ ...emptyList, total: 10 });
     vi.mocked(client.fetchCheckpoints).mockResolvedValue({ items: [], total: 0, offset: 0, limit: 14 });
+    vi.mocked(client.fetchLatestScaleReading).mockResolvedValue(neverMeasuredScale);
   });
 
   afterEach(() => vi.clearAllMocks());
@@ -213,6 +227,7 @@ describe('Today — Illness / Insufficient data', () => {
     vi.mocked(client.fetchMedicationAdherence).mockResolvedValue(defaultAdherence);
     vi.mocked(client.fetchMeasurements).mockResolvedValue({ ...emptyList, total: 10 });
     vi.mocked(client.fetchCheckpoints).mockResolvedValue({ items: [], total: 0, offset: 0, limit: 14 });
+    vi.mocked(client.fetchLatestScaleReading).mockResolvedValue(neverMeasuredScale);
   });
 
   afterEach(() => vi.clearAllMocks());

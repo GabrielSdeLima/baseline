@@ -36,6 +36,9 @@ htmlcov/
 # Ruff
 .ruff_cache/
 
+# Runtime logs (rotated daily by app/core/logging_config.py)
+logs/
+
 # Scale integration — local user profile (contains biometric data, never commit)
 scripts/scale_profile.json
 

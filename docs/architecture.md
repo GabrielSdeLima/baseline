@@ -117,37 +117,56 @@ The primary signal is **deviation from the user's individual 14-day rolling base
 
 **This is pattern detection for personal health tracking, NOT clinical diagnosis.** The heuristics are V1 approximations designed to surface anomalies relative to your own baseline. No medical decisions should be based on these signals.
 
-## HC900 Scale Integration — Dart Subprocess Bridge
+## HC900 Scale Integration — Python-Native Decoder
 
 Phase 6 adds real device data ingestion from the HC900/FG260RB BLE smart scale.
 
-### Why a Dart subprocess instead of a Python port
+### Python-native (no Dart subprocess)
 
-The HC900 decode algorithm (XOR cipher + body composition formulas) already exists in the Pulso project (`C:/src/pulso/pulso-app`) as Dart. Re-implementing it in Python would create two diverging sources of truth. Instead:
+The HC900 decode algorithm (XOR cipher + BIA regressions) is implemented entirely in Python. No Dart runtime, no external project, no subprocess. The decoder lives in three modules:
 
-1. **`tools/decode_scale.dart`** (Pulso project) is the single decode authority — it reads raw bytes from stdin, returns normalised JSON to stdout.
-2. **`scripts/import_scale.py`** calls `dart run tools/decode_scale.dart` as a subprocess.
-3. **`scripts/scan_scale.py`** handles BLE scanning via `bleak` — pure Python, no decode logic.
+- `app/integrations/hc900/protocol.py` — XOR decryption, company-ID guard (0xA0AC), 14-byte packet parsing into `WeightPacket` / `ImpedancePacket`
+- `app/integrations/hc900/body_composition.py` — BIA regression formulas (BMI, BMR, body fat, fat-free mass, muscle, water, protein, bone, FFMI, FMI)
+- `app/integrations/hc900/decoder.py` — top-level `decode_hc900()`, returns a typed `DecodedReading` dataclass tagged `hc900_ble_v2`
 
-If the decode algorithm is ever corrected in Pulso, Baseline automatically benefits at the next run — no duplicate fix.
+### 18-metric taxonomy per weighing
 
-### Stdin/stdout contract
+A single weighing produces up to 18 measurements in `metric_types`:
+
+| Category | Slugs | Condition |
+|---|---|---|
+| Primary — sensor values | `weight`, `impedance_adc` | `weight` always; `impedance_adc` only when impedance packet captured |
+| Derived — impedance-independent | `bmi`, `bmr` | Present on all readings that include a user profile |
+| Derived — impedance-dependent | `body_fat_pct`, `fat_free_mass_kg`, `fat_mass_kg`, `muscle_mass_kg`, `muscle_pct`, `skeletal_muscle_mass_kg`, `skeletal_muscle_pct`, `water_mass_kg`, `water_pct`, `protein_mass_kg`, `protein_pct`, `bone_mass_kg`, `ffmi`, `fmi` | All-or-nothing: absent when no impedance packet |
+
+### `impedance_adc` and BIA caveats
+
+`impedance_adc` is the raw sensor ADC integer — **not ohms**, not comparable to other bioimpedance devices. It is the input to the BIA regression formulas, not a standalone metric. The derived body-composition values are population-level regression estimates, not clinical truth.
+
+### Decoder version detection
+
+`ScaleService` (`app/services/scale.py`) infers decoder version from the persisted measurement set, not the frozen `payload_json.decoded.decoder_version`, which is not updated on reprocessing:
 
 ```
-# Input (JSON, one line):
-{"mfr_weight": [...14 ints...], "mfr_impedance": [...14 ints...],
- "height_cm": 180, "age": 34, "sex": 1, "captured_at": "2026-04-15T07:30:00+00:00"}
-
-# Output (JSON, one line):
-{"weight_kg": 75.84, "body_fat_pct": 24.4, "impedance_adc": 527,
- "decoder_version": "hc900_ble_v1", ...optional body comp fields...}
+{impedance_adc, bmi, bmr} ∩ persisted_slugs ≠ ∅  →  hc900_ble_v2
+otherwise, fallback to payload_json.decoded.decoder_version  →  hc900_ble_v1 (legacy)
 ```
 
-`mfr_impedance` is optional. When absent, the decoder returns weight only (no body composition).
+Historical payloads reprocessed via `scripts/reprocess_hc900.py` are correctly identified as V2 even when their `payload_json` was written by V1.
+
+### Reading states
+
+Three states are surfaced by `GET /api/v1/integrations/scale/latest` and rendered in the **Latest Scale Reading** card on the Today page:
+
+| Status | Condition |
+|---|---|
+| `full_reading` | Impedance packet captured; all impedance-dependent metrics present |
+| `weight_only` | No impedance; only `weight`, `bmi`, `bmr` available |
+| `never_measured` | No `hc900_scale` raw payload exists for this user |
 
 ### Raw bytes preservation
 
-The full 14-byte manufacturer arrays are stored as hex strings in `raw_payloads.payload_json`:
+The 14-byte manufacturer advertisement arrays are stored as hex strings in `raw_payloads.payload_json`:
 
 ```json
 {
@@ -156,11 +175,11 @@ The full 14-byte manufacturer arrays are stored as hex strings in `raw_payloads.
 }
 ```
 
-This enables offline reprocessing: if the Dart decoder is improved, historical raw payloads can be re-decoded without ever re-scanning the physical device.
+Reprocessing reads these bytes (source of truth), not the cached `decoded` dict. Decoder improvements are applied retroactively to all historical readings via `scripts/reprocess_hc900.py` without re-scanning the physical device.
 
 ### Deduplication key
 
-The HC900 has no native measurement IDs. The deterministic external ID encodes enough context to make collisions physically impossible:
+The HC900 has no native measurement IDs. A deterministic external ID makes collisions physically impossible:
 
 ```
 hc900_{mac_no_colon}_{YYYYmmddTHHMM}_{weight_grams}_{impedance_adc|x}
@@ -172,15 +191,17 @@ Example: hc900_a0915c92cf17_20260415T0730_75840_527
 - **weight_grams** — distinguishes different weights within the same minute
 - **impedance_adc** — eliminates residual collision risk; `x` when no impedance
 
-### Temporal semantics (V1)
+### Temporal semantics
 
-`captured_at` (when `bleak` captured the advertisement) equals `measured_at` (effective measurement time) in V1. They are stored separately with an explicit `_measured_at_note` in the payload JSON. Future versions may allow manual time override (e.g., user steps on scale at 07:30 but opens the app at 08:00).
+`captured_at` (when `bleak` received the advertisement) equals `measured_at` (effective measurement time). Both are stored separately in `payload_json` with an explicit `_measured_at_note`.
 
-### Known limitations (V1)
+### Known limitation — idle-phase impedance
 
-- **Idle-phase impedance**: the btsnoop-derived test data captures a BLE advertisement during the idle/reference phase (~ADC 527), not the active BIA measurement phase (~ADC 30,000–48,000). Body composition values computed from idle-phase impedance are not clinically accurate. A live `scan_scale.py` session captures the correct active-phase packet.
-- **Dart runtime required**: `dart` must be on PATH and `pulso-app` must be at `C:/src/pulso/pulso-app`. The import script fails with a clear `FileNotFoundError` if either is missing.
-- **BLE on Windows**: `bleak` on Windows requires the WinRT Bluetooth API. The BLE scanner runs correctly but may need elevated permissions on some systems.
+A BLE advertisement during the scale's idle/reference phase (~ADC 527) is not the active BIA measurement phase (~ADC 30,000–48,000). Body composition derived from idle-phase impedance is not anatomically accurate. A live `scripts/scan_scale.py` session captures the active-phase packet reliably. Test fixtures intentionally use idle-phase data as controlled input.
+
+### BLE on Windows
+
+`bleak` uses the WinRT Bluetooth API. No elevated permissions required on Windows 11 with Bluetooth enabled.
 
 ## Garmin Connect Integration — Architectural Decisions
 
@@ -259,6 +280,7 @@ TanStack Query v5 with `staleTime = 5 minutes` for all read queries. After a suc
 | `POST /symptoms/logs` | `['symptomLogs']`, `['summary', userId]` |
 | `POST /medications/logs` | `['medLogs']`, `['summary', userId]`, `['adherence', userId]` |
 | `POST /measurements/` | `['measurements']`, `['summary', userId]` |
+| `POST /integrations/scale/scan` | `['freshness-scale']`, `['measurements']`, `['scale-latest']` |
 
 The summary card always reflects the current state of the data without a manual page refresh.
 
@@ -271,6 +293,8 @@ Rather than a single "data as of" timestamp, the FreshnessBar makes three lightw
 - **Manual** — whether a morning or night checkpoint exists for today
 
 Green dot = today, amber = yesterday, grey = no data.
+
+The **Scan** button in the FreshnessBar calls `POST /integrations/scale/scan`, which runs `scripts/import_scale.py` in a subprocess and streams progress. On success, three query keys are invalidated simultaneously: `['freshness-scale']`, `['measurements']`, and `['scale-latest']`. The **Latest Scale Reading** card (powered by `GET /integrations/scale/latest`) updates in-place without a page reload.
 
 ---
 

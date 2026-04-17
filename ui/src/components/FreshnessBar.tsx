@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { isToday, isYesterday, parseISO, format } from 'date-fns';
 import { fetchMeasurements, fetchCheckpoints, scanScale, todayISO } from '../api/client';
 import { loadScaleProfile } from '../lib/scaleProfile';
+import { loadScaleDevice } from '../lib/scaleDevice';
 
 const SCAN_TIMEOUT_S = 45;
 
@@ -46,12 +47,18 @@ export default function FreshnessBar({ userId }: Props) {
   const scaleMut = useMutation({
     mutationFn: () => {
       abortRef.current = new AbortController();
-      return scanScale(userId, abortRef.current.signal, loadScaleProfile());
+      return scanScale(
+        userId,
+        abortRef.current.signal,
+        loadScaleProfile(),
+        loadScaleDevice()?.mac,
+      );
     },
     onSuccess: (data) => {
       setScaleMsg(data.message);
       qc.invalidateQueries({ queryKey: ['freshness-scale'] });
       qc.invalidateQueries({ queryKey: ['measurements'] });
+      qc.invalidateQueries({ queryKey: ['scale-latest'] });
       setTimeout(() => setScaleMsg(''), 5000);
     },
     onError: (e: Error) => {

@@ -41,6 +41,17 @@ _PKT_WEIGHT = 0x0D
 _PKT_IMPEDANCE = 0x06
 _STABLE_FLAG_MASK = 0x80   # mfr[6] bit 7 clear → scale reports stable weight
 _STABLE_CONSEC = 5         # consecutive identical weight-byte triples → stable
+_IMPEDANCE_GRACE_S = 15.0  # wait this long after stable weight for impedance packet
+
+
+class IncompleteMeasurementError(Exception):
+    """Stable weight captured but the impedance packet never arrived.
+
+    HC900 emits impedance only after the user stands still long enough for the
+    bioimpedance sweep to complete.  Stepping off early produces a weight-only
+    reading that is not usable for body composition, so we fail the scan and
+    ask the user to step back on instead of silently saving a partial record.
+    """
 
 
 class ScaleScanResult:
@@ -101,12 +112,24 @@ async def scan_for_reading(
         )
         logger.debug("[scan] result emitted for %s", detected_mac)
 
+    def _fail_incomplete() -> None:
+        if result_future.done():
+            return
+        logger.info("[scan] impedance timeout — incomplete measurement")
+        result_future.set_exception(
+            IncompleteMeasurementError(
+                "Saiu da balança antes da leitura de impedância. "
+                "Suba de novo e fique parado até o display travar."
+            )
+        )
+
     def _schedule_impedance_timeout() -> None:
         nonlocal impedance_timer_handle
         if impedance_timer_handle is None:
-            # Give the scale 15 s to send the impedance packet before falling
-            # back to a weight-only reading.
-            impedance_timer_handle = loop.call_later(15.0, _emit_now)
+            # Require impedance for a complete reading; if it doesn't arrive
+            # within the grace window, fail the scan so the user knows to
+            # step back on rather than accepting a weight-only record.
+            impedance_timer_handle = loop.call_later(_IMPEDANCE_GRACE_S, _fail_incomplete)
 
     def _callback(device: BLEDevice, adv: AdvertisementData) -> None:
         nonlocal stable_weight_bytes, impedance_bytes, last_weight_triple
@@ -196,6 +219,9 @@ def _cli() -> None:
         result = asyncio.run(scan_for_reading(mac_filter=args.mac, timeout=args.timeout))
     except TimeoutError as e:
         print(f"TIMEOUT: {e}", file=sys.stderr)
+        sys.exit(1)
+    except IncompleteMeasurementError as e:
+        print(f"INCOMPLETE: {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)

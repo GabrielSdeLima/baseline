@@ -8,10 +8,22 @@ Behaviour
    backfill every missed day in one shot.  A fresh user (no prior Garmin data)
    gets a 7-day initial backfill.
 
-2. **Recurring loop**: every ``settings.sync_interval_min`` minutes, invokes
-   ``scripts/sync_garmin.py --days 1`` to pull the latest daily summary as
-   Garmin Connect emits updates throughout the day.  Set ``SYNC_INTERVAL_MIN=0``
-   (env) to disable.
+2. **Recurring loop**: every ``settings.sync_interval_min`` minutes, re-runs
+   the same catch-up.  This both fills gaps created by PC sleep/hibernate and
+   refreshes today's measurements (body battery, stress, sleep score and HRV
+   are published throughout the day by Garmin Connect).  Set
+   ``SYNC_INTERVAL_MIN=0`` (env) to disable the recurring tick.
+
+3. **Wake-aware sleep**: the tick sleeps in short hops and watches wall-clock
+   drift against a monotonic clock.  A large positive drift during a single
+   hop means the host was suspended (S3/S4) and the wall-clock jumped forward
+   while the monotonic clock stayed frozen.  On detection the scheduler
+   exits the wait early and syncs immediately instead of sitting idle for
+   the rest of the interval.
+
+4. **Non-overlapping syncs**: an ``asyncio.Lock`` guards every invocation.
+   If a tick fires while the previous sync is still running (slow network,
+   long backfill) the new tick logs a skip and waits for the next cycle.
 
 Graceful degradation
 --------------------
@@ -23,16 +35,17 @@ without error — the API keeps serving normally.  Prerequisites:
     - ``scripts/sync_garmin.py`` is present
     - ``settings.sync_interval_min`` > 0
 
-The scheduler invokes ``sync_garmin.py`` as a subprocess (same pattern as the
-``/scale/scan`` endpoint) so the ingestion logic has one source of truth.
+Subprocess failures and unexpected exceptions from the inner catch-up are
+caught and logged — the scheduler keeps running.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import sys
+import time
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import text
@@ -47,6 +60,25 @@ _SCRIPTS_DIR = _REPO_ROOT / "scripts"
 _SYNC_SCRIPT = _SCRIPTS_DIR / "sync_garmin.py"
 _GARMIN_CONFIG = _SCRIPTS_DIR / "garmin_config.json"
 _INITIAL_BACKFILL_DAYS = 7
+
+# Wake detection threshold.  If wall-clock advanced more than this over a
+# single sleep hop while the monotonic clock barely moved, the host almost
+# certainly went to S3/S4.  60s tolerates normal scheduler jitter.
+_WAKE_DRIFT_THRESHOLD_S = 60.0
+
+# Split long waits into short hops so wake is detected promptly instead of
+# only after the full ``sync_interval_min`` has elapsed.
+_SLEEP_STEP_S = 30.0
+
+# Lazy — binds to the scheduler's running loop on first use.
+_sync_lock: asyncio.Lock | None = None
+
+
+def _get_sync_lock() -> asyncio.Lock:
+    global _sync_lock
+    if _sync_lock is None:
+        _sync_lock = asyncio.Lock()
+    return _sync_lock
 
 
 async def _last_garmin_day(user_id: uuid.UUID) -> date | None:
@@ -97,7 +129,12 @@ async def _run_sync(
 
 
 async def _catch_up(user_id_str: str) -> None:
-    """Backfill gap between the last Garmin measurement and today."""
+    """Backfill the gap between the last Garmin measurement and today.
+
+    When ``last_day >= today`` the function still re-syncs today so the
+    intraday updates Garmin Connect publishes later (body battery, stress,
+    steps, sleep score, HRV) are captured — the sync script is idempotent.
+    """
     try:
         uid = uuid.UUID(user_id_str)
     except ValueError:
@@ -115,13 +152,69 @@ async def _catch_up(user_id_str: str) -> None:
             _INITIAL_BACKFILL_DAYS, start,
         )
     elif last_day >= today:
-        logger.info("[garmin-sync] already up to date (last=%s)", last_day)
-        return
+        start = today
+        logger.info("[garmin-sync] refreshing today (last=%s)", last_day)
     else:
         start = last_day + timedelta(days=1)
         logger.info("[garmin-sync] catch-up from %s to %s", start, today)
 
     await _run_sync(user_id_str, start_date=start, end_date=today)
+
+
+async def _guarded_catch_up(user_id: str) -> bool:
+    """Run ``_catch_up`` under the anti-overlap lock.
+
+    Returns True if the catch-up ran (even if the inner call failed), False
+    if it was skipped because a previous sync was still in progress.
+    Exceptions from ``_catch_up`` are logged and swallowed so the scheduler
+    loop keeps ticking.
+    """
+    lock = _get_sync_lock()
+    if lock.locked():
+        logger.info(
+            "[garmin-sync] previous sync still running — skipping this tick"
+        )
+        return False
+    async with lock:
+        try:
+            await _catch_up(user_id)
+        except Exception:
+            logger.exception("[garmin-sync] sync failed; will retry next cycle")
+    return True
+
+
+async def _wake_aware_sleep(
+    seconds: float, *, step_s: float = _SLEEP_STEP_S
+) -> bool:
+    """Sleep for up to ``seconds`` seconds, returning early when the host
+    appears to have woken from S3/S4 sleep.
+
+    Implementation: sleep in short hops.  After each hop, compare wall-clock
+    elapsed against monotonic elapsed — a large positive drift means the
+    host was suspended during the hop (wall-clock keeps advancing while the
+    monotonic clock stays frozen on most OSes).  On detection, log and
+    return True so the caller can run a catch-up immediately.
+
+    Returns False when the full duration elapsed normally.
+    """
+    remaining = seconds
+    while remaining > 0:
+        step = min(step_s, remaining)
+        wall_before = datetime.now()
+        mono_before = time.monotonic()
+        await asyncio.sleep(step)
+        mono_elapsed = time.monotonic() - mono_before
+        wall_elapsed = (datetime.now() - wall_before).total_seconds()
+        drift = wall_elapsed - mono_elapsed
+        if drift >= _WAKE_DRIFT_THRESHOLD_S:
+            logger.info(
+                "[garmin-sync] detected wake from system sleep "
+                "(monotonic=%.0fs, wall=%.0fs, drift=%.0fs)",
+                mono_elapsed, wall_elapsed, drift,
+            )
+            return True
+        remaining -= step
+    return False
 
 
 def _prerequisites_ok() -> tuple[bool, str]:
@@ -140,8 +233,8 @@ def _prerequisites_ok() -> tuple[bool, str]:
 async def run_scheduler() -> None:
     """Main loop — called from the FastAPI lifespan.
 
-    Cancelled cleanly on API shutdown.  Any subprocess failure is logged and
-    does not stop the loop; the next iteration will retry.
+    Cancelled cleanly on API shutdown.  Any subprocess failure or catch-up
+    exception is caught by ``_guarded_catch_up`` and does not stop the loop.
     """
     ok, reason = _prerequisites_ok()
     if not ok:
@@ -156,13 +249,12 @@ async def run_scheduler() -> None:
     )
 
     try:
-        await _catch_up(user_id)
+        await _guarded_catch_up(user_id)
         while True:
-            await asyncio.sleep(interval_s)
-            try:
-                await _run_sync(user_id, days=1)
-            except Exception:
-                logger.exception("[garmin-sync] iteration failed; will retry next cycle")
+            woke = await _wake_aware_sleep(interval_s)
+            if woke:
+                logger.info("[garmin-sync] running catch-up after wake")
+            await _guarded_catch_up(user_id)
     except asyncio.CancelledError:
         logger.info("[garmin-sync] scheduler stopped")
         raise

@@ -103,36 +103,72 @@ Combined with auto-sync, this means: **turn the PC on → API starts → Garmin 
 
 ### Prerequisites
 
-- Pulso app cloned at `C:/src/pulso/pulso-app` with `flutter pub get` completed
-- `dart` on PATH
-- Bluetooth available (Windows: WinRT Bluetooth API via `bleak`)
+- Bluetooth available (Windows: WinRT Bluetooth API via `bleak` — no elevated permissions needed on Windows 11)
+- No Dart runtime or external project required — the decoder is Python-native
 
 ```bash
 cp scripts/scale_profile.json.example scripts/scale_profile.json
 # edit: height_cm, birth_date (YYYY-MM-DD), sex (1 = male, 2 = female)
 ```
 
+### Pairing / device targeting
+
+The scale is identified by BLE company ID `0xA0AC`. If multiple HC900 units are in range, pass `--mac` to target a specific one:
+
+```bash
+python scripts/discover_scales.py   # list nearby HC900 MAC addresses
+```
+
 ### Import a reading
 
 ```bash
-# Step on the scale, wait for it to stabilise, then run:
+# Step on the scale, wait for it to stabilise (green light), then:
 python scripts/import_scale.py --user-id <UUID>
 
-# Preview without writing
-python scripts/import_scale.py --user-id <UUID> --dry-run
-
-# If multiple HC900 scales are nearby, target by MAC address
+# Target a specific scale by MAC
 python scripts/import_scale.py --user-id <UUID> --mac A0:91:5C:92:CF:17
+
+# Override profile fields without editing the JSON file
+python scripts/import_scale.py --user-id <UUID> --height-cm 180 --birth-date 1991-08-15 --sex 1
+
+# Preview without writing to the database
+python scripts/import_scale.py --user-id <UUID> --dry-run
 ```
 
-The script scans BLE passively for up to 15 seconds, captures the stable weight packet (and impedance if available), calls the Pulso Dart decoder, and POSTs to the API. Re-running for the same measurement is safe (deduplication by `hc900_{mac}_{timestamp}_{weight_grams}_{impedance_adc}`).
+The script scans BLE passively for up to 15 seconds, captures the stable weight packet (and impedance when available), decodes natively via `app.integrations.hc900`, and POSTs to the API. Re-running for the same measurement is safe (deduplication by `hc900_{mac}_{timestamp}_{weight_grams}_{impedance_adc}`).
 
 ### What gets imported
 
-- `weight` (always)
-- `body_fat_pct` (only when impedance packet was captured in the active BIA measurement phase)
+Up to 18 measurements per weighing, depending on what the scale transmitted:
 
-Freshness is shown in the "Scale last weight reading" chip in the FreshnessBar.
+| State | Metrics stored |
+|---|---|
+| `full_reading` — impedance captured | `weight`, `impedance_adc`, `bmi`, `bmr`, and all 14 impedance-dependent body-comp metrics |
+| `weight_only` — no impedance packet | `weight`, `bmi`, `bmr` |
+| `never_measured` — first run, no data | nothing stored yet |
+
+The **Latest Scale Reading** card on the Today page shows which state the most recent weighing is in.
+
+### Scan from the UI
+
+The **Scan** button in the FreshnessBar triggers the same pipeline via `POST /api/v1/integrations/scale/scan`. The profile and MAC address come from the Settings page (`localStorage`). On success, the Latest Scale Reading card updates automatically — no page reload required.
+
+### Reprocess historical readings
+
+If the decoder is updated, apply it to all historical payloads without re-scanning the device:
+
+```bash
+# Reprocess all HC900 payloads for a user (date range optional)
+python scripts/reprocess_hc900.py --user-id <UUID>
+python scripts/reprocess_hc900.py --user-id <UUID> --start-date 2026-01-01 --end-date 2026-04-16
+
+# Preview: show what would change without writing
+python scripts/reprocess_hc900.py --user-id <UUID> --dry-run
+```
+
+This replaces existing curated measurements for each payload in scope using the current V2 decoder (`hc900_ble_v2`). The raw bytes in `raw_payloads.payload_json` are the source of truth — they are never modified.
+
+Freshness is shown in the **Scale** chip in the FreshnessBar.
 
 ---
 
@@ -159,7 +195,7 @@ Weight is intentionally absent — the scale import handles it automatically.
 
 A suggested routine that keeps the data complete:
 
-1. **Step on the scale** (morning, before eating): `python scripts/import_scale.py --user-id <UUID>`
+1. **Step on the scale** (morning, before eating): `python scripts/import_scale.py --user-id <UUID>` or use the **Scan** button in the FreshnessBar
 2. **Morning check-in** (UI, Check-in tab): log sleep quality, energy, mood
 3. **Garmin sync** (can run at any time): `python scripts/sync_garmin.py --user-id <UUID>`
 4. **Log symptoms** as they occur during the day
@@ -172,13 +208,14 @@ A suggested routine that keeps the data complete:
 
 ### Today page
 
-| Card | What it shows | What "insufficient_data" means |
+| Card | What it shows | What "insufficient_data" / empty state means |
 |------|--------------|-------------------------------|
 | Illness Signal | Composite deviation signal (temp z-score, HRV z-score, resting HR z-score, symptom burden) | Fewer than 3 HRV readings — baseline not yet established |
 | Recovery Status | HRV trend vs training load | Same as above |
 | Physiological Deviations | Metrics where \|z-score\| > 2.0 vs your 14-day rolling average | Shows "Baseline forming" when HRV count < 3 |
 | Symptom Burden | Sum of today's symptom intensities | — |
 | Medication Adherence | Overall % across active regimens | "No active regimens" when none configured |
+| Latest Scale Reading | Most recent weighing: weight, body-comp grid, BIA caveat | "No readings yet — use the Scan button" when `never_measured` |
 
 **FreshnessBar interpretation:**
 
@@ -231,8 +268,10 @@ The seed script prints the created user's UUID. Use that UUID in the UI or when 
 |---------|-------------|-----|
 | API returns 503 on `/` | UI not built | `npm --prefix ui run build` |
 | Garmin sync: `401 Unauthorized` | Token expired | Delete the `token_store` file, re-run sync to re-authenticate |
-| Scale import: `FileNotFoundError` for `decode_scale.dart` | Pulso app not at expected path | Verify `C:/src/pulso/pulso-app/tools/decode_scale.dart` exists |
 | Scale import: `Data source 'hc900_ble' not found` | Migration not run | `alembic upgrade head` |
+| Scale import: `Impedance packet present but user profile … incomplete` | `scale_profile.json` missing height, birth_date, or sex | Edit `scripts/scale_profile.json` or pass `--height-cm`, `--birth-date`, `--sex` flags |
+| Scale card shows `weight_only` unexpectedly | Impedance packet not captured (scale idle phase) | Step on the scale and wait for the stable green-light reading before scanning |
+| Scale card still shows old data after Scan | Browser cache — stale `scale-latest` key | Hard-reload (Ctrl+Shift+R) once; if recurring, check that `onSuccess` invalidation fires in network tab |
 | `insufficient_data` on all cards | Not enough data yet | Sync at least 3 days of Garmin data |
 | FreshnessBar all grey | No data for any source | Run Garmin sync, log a checkpoint |
 | Deviations never flag anything | Baseline too stable or threshold too high | Default threshold is `|z| > 2.0`; seed data has clear deviations in illness phase |

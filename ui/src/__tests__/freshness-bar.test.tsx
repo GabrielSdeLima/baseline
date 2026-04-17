@@ -193,7 +193,12 @@ describe('FreshnessBar — Scan button', () => {
     renderFreshnessBar();
     await waitFor(() => screen.getByRole('button', { name: /^scan$/i }));
     await user.click(screen.getByRole('button', { name: /^scan$/i }));
-    expect(client.scanScale).toHaveBeenCalledWith(USER_ID, expect.any(AbortSignal), expect.any(Object));
+    expect(client.scanScale).toHaveBeenCalledWith(
+      USER_ID,
+      expect.any(AbortSignal),
+      expect.any(Object),
+      undefined,
+    );
   });
 
   it('shows "Scanning… 45s" and disables button while pending', async () => {

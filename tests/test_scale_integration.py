@@ -1,10 +1,10 @@
 """HC900 BLE scale integration tests.
 
 Covers the full HC900 ingestion pipeline:
-  A. Full pipeline — real representative payload → raw_payloads + 2 measurements
+  A. Full pipeline — real representative payload → raw_payloads + 18 measurements
   B. Payload persistence — raw bytes, format_version, device_mac preserved verbatim
   C. Measurements traceability — raw_payload_id FK, correct values/units/aggregation
-  D. Weight-only path — no impedance → only weight measurement, no body_fat_pct
+  D. Weight-only path — no impedance → 3 measurements (weight, bmi, bmr); body-comp absent
   E. Deduplication — re-ingest same external_id → idempotent (same record, no new rows)
   F. Error paths — missing hc900_ble source, malformed payload (missing measured_at)
   G. Profile helpers — calculate_age, build_external_id, load_profile (pure unit tests)
@@ -38,16 +38,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 # ── Shared payload fixtures ───────────────────────────────────────────────────
 
-# Decoded output from the Dart CLI for the btsnoop capture.
+# Decoded output from the Baseline HC900 decoder for the btsnoop capture.
+# Validated against the reference Pulso dart CLI: these values are what a
+# 180 cm / 34 y / male subject weighing 75.84 kg with ADC 527 produces.
 _DECODED_FULL = {
     "weight_kg": 75.84,
-    "decoder_version": "hc900_ble_v1",
+    "decoder_version": "hc900_ble_v2",
     "impedance_adc": 527,
-    "body_fat_pct": 24.4,
-    "muscle_pct": 38.4,
-    "bone_mass_kg": 3.2,
-    "water_pct": 57.8,
-    "bmr": 1889,
+    "bmi": 23.4,
+    "bmr": 1718,
+    "body_fat_pct": 21.5,
+    "fat_free_mass_kg": 59.5,
+    "fat_mass_kg": 16.3,
+    "skeletal_muscle_mass_kg": 31.2,
+    "skeletal_muscle_pct": 41.1,
+    "muscle_mass_kg": 39.0,
+    "muscle_pct": 51.4,
+    "water_mass_kg": 43.6,
+    "water_pct": 57.5,
+    "protein_mass_kg": 11.6,
+    "protein_pct": 15.2,
+    "bone_mass_kg": 3.4,
+    "ffmi": 18.4,
+    "fmi": 5.0,
 }
 
 # Full hc900_ble_v1 payload — mirrors what import_scale.py::build_raw_payload produces.
@@ -114,10 +127,10 @@ def _ingest_request(
 
 
 class TestHC900Pipeline:
-    async def test_full_payload_creates_two_measurements(
+    async def test_full_payload_creates_eighteen_measurements(
         self, db: AsyncSession, user: User
     ):
-        """Full HC900 payload (weight + body_fat_pct) → 2 measurements, status processed."""
+        """Full HC900 payload (weight + impedance + profile) → 18 measurements, status processed."""
         svc = IngestionService(db)
         payload = await svc.ingest(_ingest_request(user, _FULL_PAYLOAD_JSON))
 
@@ -128,12 +141,12 @@ class TestHC900Pipeline:
             select(Measurement).where(Measurement.raw_payload_id == payload.id)
         )
         measurements = list(result.scalars().all())
-        assert len(measurements) == 2
+        assert len(measurements) == 18
 
     async def test_measurement_values_and_units(
         self, db: AsyncSession, user: User
     ):
-        """Decoded weight and body_fat_pct land in measurements with correct values/units."""
+        """Decoded metrics land in measurements with correct values/units and is_derived flags."""
         svc = IngestionService(db)
         payload = await svc.ingest(_ingest_request(user, _FULL_PAYLOAD_JSON))
 
@@ -147,18 +160,40 @@ class TestHC900Pipeline:
             mt = await db.get(MetricType, m.metric_type_id)
             by_slug[mt.slug] = m
 
+        # Primary (is_derived=false): weight + impedance_adc
         assert "weight" in by_slug
-        assert "body_fat_pct" in by_slug
-
         weight_m = by_slug["weight"]
         assert round(weight_m.value_num, 2) == Decimal("75.84")
         assert weight_m.unit == "kg"
         assert weight_m.aggregation_level == "spot"
+        assert weight_m.is_derived is False
 
+        assert "impedance_adc" in by_slug
+        imp_m = by_slug["impedance_adc"]
+        assert int(imp_m.value_num) == 527
+        assert imp_m.unit == "adc"
+        assert imp_m.is_derived is False
+
+        # Derived, impedance-independent: bmi, bmr
+        assert round(by_slug["bmi"].value_num, 1) == Decimal("23.4")
+        assert by_slug["bmi"].unit == "kg/m²"
+        assert by_slug["bmi"].is_derived is True
+        assert int(by_slug["bmr"].value_num) == 1718
+        assert by_slug["bmr"].unit == "kcal"
+        assert by_slug["bmr"].is_derived is True
+
+        # Derived, impedance-dependent (spot-check a few)
         bf_m = by_slug["body_fat_pct"]
-        assert round(bf_m.value_num, 1) == Decimal("24.4")
+        assert round(bf_m.value_num, 1) == Decimal("21.5")
         assert bf_m.unit == "%"
         assert bf_m.aggregation_level == "spot"
+        assert bf_m.is_derived is True
+
+        assert round(by_slug["fat_free_mass_kg"].value_num, 1) == Decimal("59.5")
+        assert round(by_slug["fat_mass_kg"].value_num, 1) == Decimal("16.3")
+        assert round(by_slug["skeletal_muscle_mass_kg"].value_num, 1) == Decimal("31.2")
+        assert round(by_slug["water_pct"].value_num, 1) == Decimal("57.5")
+        assert round(by_slug["ffmi"].value_num, 1) == Decimal("18.4")
 
     async def test_measured_at_preserved_on_measurements(
         self, db: AsyncSession, user: User
@@ -228,10 +263,10 @@ class TestHC900PayloadPersistence:
 
 
 class TestHC900WeightOnly:
-    async def test_weight_only_creates_one_measurement(
+    async def test_weight_only_creates_weight_bmi_bmr(
         self, db: AsyncSession, user: User
     ):
-        """When impedance is absent from the payload, only weight is created (no body_fat_pct)."""
+        """No impedance but profile present → 3 measurements: weight, bmi, bmr (no body-comp)."""
         svc = IngestionService(db)
         payload = await svc.ingest(
             _ingest_request(
@@ -247,11 +282,16 @@ class TestHC900WeightOnly:
             select(Measurement).where(Measurement.raw_payload_id == payload.id)
         )
         measurements = list(result.scalars().all())
-        assert len(measurements) == 1
+        assert len(measurements) == 3
 
         from app.models.metric_type import MetricType
-        mt = await db.get(MetricType, measurements[0].metric_type_id)
-        assert mt.slug == "weight"
+        slugs: set[str] = set()
+        for m in measurements:
+            mt = await db.get(MetricType, m.metric_type_id)
+            slugs.add(mt.slug)
+
+        # Only impedance-independent metrics persist — no body_fat_pct / ffm / etc.
+        assert slugs == {"weight", "bmi", "bmr"}
 
     async def test_weight_only_value_correct(
         self, db: AsyncSession, user: User
@@ -306,7 +346,7 @@ class TestHC900Deduplication:
     async def test_duplicate_does_not_create_extra_measurements(
         self, db: AsyncSession, user: User
     ):
-        """Deduplication: measurement count stays at 2 after re-ingest."""
+        """Deduplication: measurement count stays at 18 after re-ingest."""
         svc = IngestionService(db)
         first = await svc.ingest(_ingest_request(user, _FULL_PAYLOAD_JSON))
         await svc.ingest(_ingest_request(user, _FULL_PAYLOAD_JSON))
@@ -316,7 +356,7 @@ class TestHC900Deduplication:
             .select_from(Measurement)
             .where(Measurement.raw_payload_id == first.id)
         )
-        assert count == 2
+        assert count == 18
 
 
 # ── E. Error paths ────────────────────────────────────────────────────────────

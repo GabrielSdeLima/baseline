@@ -133,14 +133,25 @@ delta_pct       = delta_abs / baseline_avg * 100  (NULL when avg = 0)
   "raw_mfr_weight_hex":    "aca017cf925c91a0202d88e00da2",
   "raw_mfr_impedance_hex": "aca017cf925c91a0a2afa0a206b9",
   "decoded": {
-    "weight_kg": 75.84,
-    "decoder_version": "hc900_ble_v1",
-    "impedance_adc": 527,
-    "body_fat_pct": 24.4,
-    "muscle_pct": 38.4,
-    "bone_mass_kg": 3.2,
-    "water_pct": 57.8,
-    "bmr": 1889
+    "decoder_version":         "hc900_ble_v2",
+    "weight_kg":               76.89,
+    "impedance_adc":           526,
+    "bmi":                     23.7,
+    "bmr":                     1713,
+    "body_fat_pct":            21.5,
+    "fat_free_mass_kg":        60.3,
+    "fat_mass_kg":             16.5,
+    "muscle_mass_kg":          39.5,
+    "muscle_pct":              51.4,
+    "skeletal_muscle_mass_kg": 31.6,
+    "skeletal_muscle_pct":     41.1,
+    "water_mass_kg":           44.1,
+    "water_pct":               57.4,
+    "protein_mass_kg":         11.7,
+    "protein_pct":             15.2,
+    "bone_mass_kg":             3.4,
+    "ffmi":                    18.6,
+    "fmi":                      5.1
   },
   "user_profile_snapshot": {
     "height_cm": 180, "birth_date": "1991-08-15", "age": 34, "sex": 1
@@ -148,16 +159,60 @@ delta_pct       = delta_abs / baseline_avg * 100  (NULL when avg = 0)
 }
 ```
 
-`mfr_impedance_hex` and all body composition fields in `decoded` are `null`/absent when the scale did not transmit an impedance packet before the 15-second fallback timer.
+`raw_mfr_impedance_hex` and all impedance-dependent fields in `decoded` are `null`/absent when the scale did not transmit an impedance packet. `format_version` records the ingestion contract revision and does not change when payloads are reprocessed.
 
 ### Normalised output
 
-The `_parse_hc900_scale` parser (V1 scope) extracts two measurements:
+The `_parse_hc900_scale` parser (V2) extracts up to 18 measurements per raw payload. All slugs must be pre-seeded in `metric_types` via the Alembic migration before ingestion.
+
+**Primary — sensor values (`is_derived = false`)**
 
 | `decoded` key | `metric_slug` | unit | condition |
 |---|---|---|---|
 | `weight_kg` | `weight` | `kg` | always |
-| `body_fat_pct` | `body_fat_pct` | `%` | only when present |
+| `impedance_adc` | `impedance_adc` | `adc` | only when impedance packet captured |
+
+> `impedance_adc` is a raw sensor ADC integer, **not ohms**. It is the input to the BIA regression formulas and not a standalone health metric.
+
+**Derived — impedance-independent (`is_derived = true`)**
+
+| `decoded` key | `metric_slug` | unit | condition |
+|---|---|---|---|
+| `bmi` | `bmi` | `kg/m²` | when profile present (height, age, sex) |
+| `bmr` | `bmr` | `kcal` | when profile present |
+
+**Derived — impedance-dependent (`is_derived = true`)**
+
+| `decoded` key | `metric_slug` | unit |
+|---|---|---|
+| `body_fat_pct` | `body_fat_pct` | `%` |
+| `fat_free_mass_kg` | `fat_free_mass_kg` | `kg` |
+| `fat_mass_kg` | `fat_mass_kg` | `kg` |
+| `muscle_mass_kg` | `muscle_mass_kg` | `kg` |
+| `muscle_pct` | `muscle_pct` | `%` |
+| `skeletal_muscle_mass_kg` | `skeletal_muscle_mass_kg` | `kg` |
+| `skeletal_muscle_pct` | `skeletal_muscle_pct` | `%` |
+| `water_mass_kg` | `water_mass_kg` | `kg` |
+| `water_pct` | `water_pct` | `%` |
+| `protein_mass_kg` | `protein_mass_kg` | `kg` |
+| `protein_pct` | `protein_pct` | `%` |
+| `bone_mass_kg` | `bone_mass_kg` | `kg` |
+| `ffmi` | `ffmi` | `kg/m²` |
+| `fmi` | `fmi` | `kg/m²` |
+
+All 14 impedance-dependent metrics are persisted together or not at all. Presence of `body_fat_pct` in the measurement set is the canonical probe for impedance capture.
+
+> These values are population-level BIA regression estimates — not clinical truth.
+
+**Reading states and the `scale/latest` endpoint**
+
+`GET /api/v1/integrations/scale/latest` returns one coherent weighing as a unit (all metrics from the same `raw_payload_id`):
+
+| `status` | Condition |
+|---|---|
+| `full_reading` | `body_fat_pct` present in the measurement set |
+| `weight_only` | No impedance; only `weight`, `bmi`, `bmr` available |
+| `never_measured` | No `hc900_scale` raw payload exists for this user |
 
 `aggregation_level = "spot"`, `measured_at` taken from `payload_json.measured_at`.
 
@@ -228,7 +283,7 @@ The `_parse_garmin_connect_daily` parser produces up to 10 measurements per payl
 ## V1 Constraints (explicit limits)
 
 - **Single user in practice.** The schema supports multi-tenancy (all event tables have `user_id` FK), but V1 doesn't implement authentication or authorization beyond "regimen belongs to user."
-- **No derived metrics.** `is_derived` and `confidence` columns exist in the schema but no V1 pipeline populates them. They're placeholders for future calculated metrics (e.g., training load score).
+- **Derived metrics — HC900 only.** `is_derived = true` is set on all 16 computed HC900 metrics (bmi, bmr, and the 14 impedance-dependent fields). All other pipelines (Garmin, manual) leave `is_derived = false`. The `confidence` column exists as a schema extension point but is not populated by any pipeline.
 - **No unit conversion.** Measurements store the unit as-is. A future normalisation layer could convert lbs→kg or °F→°C on ingestion.
 - **No time-series aggregation.** `aggregation_level` (spot/hourly/daily) is stored but no V1 pipeline generates rollups. The column enables future pre-aggregation without schema changes.
 - **Append-only, no corrections.** If a measurement is wrong, you insert a new one — there's no UPDATE/DELETE pattern defined.

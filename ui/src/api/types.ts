@@ -166,3 +166,22 @@ export interface MedicationRegimenList {
   offset: number;
   limit: number;
 }
+
+export type ScaleReadingStatus = 'full_reading' | 'weight_only' | 'never_measured';
+
+export interface ScaleMetric {
+  slug: string;
+  /** Stringified Decimal from the API — parse with Number(m.value). */
+  value: string;
+  unit: string;
+  is_derived: boolean;
+}
+
+export interface LatestScaleReading {
+  status: ScaleReadingStatus;
+  measured_at: string | null;
+  raw_payload_id: string | null;
+  decoder_version: string | null;
+  has_impedance: boolean;
+  metrics: Record<string, ScaleMetric>;
+}

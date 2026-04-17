@@ -99,7 +99,7 @@ A minimal single-page application built to stay out of the way of the data.
 
 | View | Purpose |
 |------|---------|
-| **Today** | Daily summary — illness signal, recovery status, physiological deviations, symptom burden, medication adherence. FreshnessBar shows when each data source last reported. |
+| **Today** | Daily summary — illness signal, recovery status, physiological deviations, symptom burden, medication adherence, latest scale reading. FreshnessBar shows when each data source last reported; Scan button triggers HC900 import. |
 | **Timeline** | 7-day rolling table — HRV, illness signal, recovery status, symptoms, check-ins per day. |
 | **Quick Input** | Modal for logging checkpoints (morning/night), symptoms, medication doses, and manual measurements (body temperature). |
 
@@ -109,7 +109,7 @@ A minimal single-page application built to stay out of the way of the data.
 - Mutations invalidate the `['summary', userId]` cache key immediately; no manual refresh required.
 - `FreshnessBar` makes three lightweight queries: Garmin (via `hrv_rmssd`), Scale (via `weight`), Manual (today's checkpoints). Each shows "today / yesterday / no data" independently.
 - Deviations card shows **"Baseline forming"** when fewer than 3 HRV readings exist, rather than misleading zero-deviation state.
-- Weight is intentionally absent from Quick Input — HC900 ingestion is automatic via `scripts/import_scale.py`.
+- Weight is intentionally absent from Quick Input — HC900 ingestion is automatic via `scripts/import_scale.py` or the Scan button in the FreshnessBar.
 
 ## Testing
 
@@ -121,7 +121,7 @@ pytest -v
 npm --prefix ui test
 ```
 
-**Total: 187 tests — 152 backend + 35 frontend. All green.**
+**Total: 278 tests — 206 backend + 72 frontend. All green.**
 
 **Backend tests:**
 
@@ -132,17 +132,23 @@ npm --prefix ui test
 | `test_domain_rules.py` | 11 | Slug resolution, medication authorization, checkpoint uniqueness, Pydantic schema validation |
 | `test_api.py` | 8 | HTTP status codes, pagination, error propagation |
 | `test_insights.py` | 63 | Classification functions, view contracts, insufficient_data semantics, stable vs experimental separation, filter/range tests, heuristic regression, feature engineering math, service-level, API |
-| `test_scale_integration.py` | 23 | Full HC900 pipeline (weight + body_fat_pct), payload audit fields, deduplication, missing-source error, malformed-payload rollback, profile helpers |
+| `test_hc900_decoder.py` | 14 | Decoder paths: weight-only, full body-comp, profile validation, decoder-version tagging |
+| `test_hc900_body_composition.py` | 28 | BIA formula accuracy — BMI, BMR, body fat, fat-free mass, muscle, water, protein, bone, FFMI, FMI |
+| `test_scale_integration.py` | 23 | Full HC900 pipeline (V2, 18 metrics), payload audit fields, deduplication, missing-source error, malformed-payload rollback, profile helpers |
+| `test_scale_latest.py` | 12 | `/scale/latest`: never_measured, full_reading, weight_only; multi-user isolation; coherence (all metrics from same raw_payload_id) |
 | `test_garmin_integration.py` | 25 | Parser (10 metrics), timezone semantics (measured_at = noon local), null-safety, deduplication, error paths, sync helpers |
 
 **Frontend tests:**
 
 | File | Count | What it covers |
 |---|---|---|
-| `today.test.tsx` | 11 | Symptom burden type coercion, medication no-regimens vs 0% adherence, baseline forming state, FreshnessBar rendering, insufficient_data notes |
-| `freshness-bar.test.tsx` | 7 | Per-source chips (Garmin, Scale, Manual), today/yesterday/no-data labels |
-| `quick-input.test.tsx` | 14 | No weight in Measure tab, started_at collapsible, morning/night ScoreRow order, med log empty state, cache invalidation after each mutation type |
-| `timeline.test.tsx` | 5 | Legend, column headers, 7-row count, today marker |
+| `today.test.tsx` | 12 | Symptom burden type coercion, medication no-regimens vs 0% adherence, baseline forming state, FreshnessBar rendering, insufficient_data notes |
+| `freshness-bar.test.tsx` | 14 | Per-source chips (Garmin, Scale, Manual), today/yesterday/no-data labels, Scan button states (pending, cancel, success, error) |
+| `quick-input.test.tsx` | 11 | No weight in Measure tab, started_at collapsible, morning/night ScoreRow order, med log empty state, cache invalidation after each mutation type |
+| `timeline.test.tsx` | 10 | Legend, column headers, 7-row count, today marker, week navigation (Prev/Next, date label, disabled states) |
+| `medications.test.tsx` | 14 | Medications page — regimen list, log submission, empty states |
+| `scale-reading-card.test.tsx` | 10 | Four render states: full_reading V2 (18 metrics), full_reading V1 partial (graceful degradation), weight_only (BIA warning), never_measured (empty state) |
+| `scale-scan-invalidation.test.tsx` | 1 | Scan → scale-latest invalidation → card auto-update without page reload |
 
 ## Seed Scenario
 
@@ -230,10 +236,9 @@ python scripts/sync_garmin.py --user-id <UUID> --dry-run
 
 ## Real Scale Integration (HC900 BLE)
 
-Baseline ingests real measurements from an HC900/FG260RB BLE smart scale.
+Baseline ingests real measurements from an HC900/FG260RB BLE smart scale. The decoder is Python-native (`hc900_ble_v2`) — no Dart runtime or external project required.
 
 ```bash
-# Prerequisites: PostgreSQL + API running, Pulso app at C:/src/pulso/pulso-app
 cp scripts/scale_profile.json.example scripts/scale_profile.json
 # edit height_cm, birth_date, sex
 
@@ -243,17 +248,32 @@ python scripts/import_scale.py --user-id <UUID>
 # Dry-run: scan and decode but don't submit
 python scripts/import_scale.py --user-id <UUID> --dry-run
 
-# Filter by MAC address (if multiple scales nearby)
+# Target a specific scale by MAC address
 python scripts/import_scale.py --user-id <UUID> --mac A0:91:5C:92:CF:17
+
+# Reprocess all historical payloads with the current decoder
+python scripts/reprocess_hc900.py --user-id <UUID>
 ```
 
 **How it works:**
-1. `scan_scale.py` passively scans BLE for HC900 advertisements (company ID `0xA0AC`)
-2. `import_scale.py` calls `dart run tools/decode_scale.dart` (Pulso project) via subprocess — Pulso is the authoritative decode source
-3. The normalised payload is POSTed to `/api/v1/raw-payloads/ingest` with a deterministic `external_id` for deduplication
-4. The `_parse_hc900_scale` parser extracts `weight` and `body_fat_pct` into the curated layer
+1. `scripts/scan_scale.py` passively scans BLE for HC900 advertisements (company ID `0xA0AC`)
+2. `scripts/import_scale.py` decodes raw bytes natively via `app.integrations.hc900` (Python-native `hc900_ble_v2` — no subprocess)
+3. The normalised payload is POSTed to the API with a deterministic `external_id` for deduplication
+4. `IngestionService._parse_hc900_scale` extracts up to 18 measurements into the curated layer
+
+**Up to 18 metrics per weighing:**
+
+| Category | Slugs |
+|---|---|
+| Primary (sensor) | `weight`, `impedance_adc` |
+| Derived — impedance-independent | `bmi`, `bmr` |
+| Derived — impedance-dependent | `body_fat_pct`, `fat_free_mass_kg`, `fat_mass_kg`, `muscle_mass_kg`, `muscle_pct`, `skeletal_muscle_mass_kg`, `skeletal_muscle_pct`, `water_mass_kg`, `water_pct`, `protein_mass_kg`, `protein_pct`, `bone_mass_kg`, `ffmi`, `fmi` |
 
 **Deduplication key:** `hc900_{mac}_{YYYYmmddTHHMM}_{weight_grams}_{impedance_adc|x}`
+
+**`GET /api/v1/integrations/scale/latest`** returns the most recent weighing as a coherent unit (all metrics from the same `raw_payload_id`) with status `full_reading` / `weight_only` / `never_measured`. The **Latest Scale Reading** card on the Today page renders this directly — no per-metric queries.
+
+> `impedance_adc` is a raw ADC integer, not ohms. Body-composition values are population-level BIA regression estimates, not clinical measurements.
 
 ## Analytical Queries
 

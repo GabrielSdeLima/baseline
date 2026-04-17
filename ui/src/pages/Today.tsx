@@ -5,12 +5,14 @@ import {
   fetchDeviations,
   fetchMedicationAdherence,
   fetchMeasurements,
+  fetchLatestScaleReading,
   nDaysAgoISO,
   todayISO,
 } from '../api/client';
 import InsightCard from '../components/InsightCard';
 import SignalBadge from '../components/SignalBadge';
 import FreshnessBar from '../components/FreshnessBar';
+import ScaleReadingCard from '../components/ScaleReadingCard';
 
 type TrendDir = '↑' | '↓' | '→';
 
@@ -86,6 +88,13 @@ export default function Today() {
   const hrvCountQ = useQuery({
     queryKey: ['measurements', userId, 'hrv_rmssd', 14],
     queryFn: () => fetchMeasurements(userId, 'hrv_rmssd', 14),
+    enabled: !!userId,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const scaleLatestQ = useQuery({
+    queryKey: ['scale-latest', userId],
+    queryFn: () => fetchLatestScaleReading(userId),
     enabled: !!userId,
     staleTime: 5 * 60 * 1000,
   });
@@ -239,6 +248,13 @@ export default function Today() {
           </div>
         )}
       </InsightCard>
+
+      {/* Latest Scale Reading — Stable */}
+      <ScaleReadingCard
+        data={scaleLatestQ.data}
+        isLoading={scaleLatestQ.isLoading}
+        error={scaleLatestQ.error as Error | null}
+      />
 
       {/* Medication Adherence — Stable */}
       <InsightCard

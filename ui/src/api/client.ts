@@ -9,6 +9,7 @@ import type {
   SymptomLogList,
   MedicationRegimenList,
   MedicationDefinitionResponse,
+  LatestScaleReading,
 } from './types';
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
@@ -141,8 +142,58 @@ export interface ScaleProfileParams {
   sex?: number;
 }
 
-export const scanScale = (userId: string, signal?: AbortSignal, profile?: ScaleProfileParams) =>
+export const fetchLatestScaleReading = (userId: string) =>
+  apiFetch<LatestScaleReading>(
+    `/integrations/scale/latest${qs({ user_id: userId })}`
+  );
+
+export const scanScale = (
+  userId: string,
+  signal?: AbortSignal,
+  profile?: ScaleProfileParams,
+  mac?: string,
+) =>
   apiFetch<{ status: string; message: string }>(
-    `/integrations/scale/scan${qs({ user_id: userId, ...profile })}`,
+    `/integrations/scale/scan${qs({ user_id: userId, ...profile, mac })}`,
     { method: 'POST', signal }
   );
+
+export interface DiscoveredScale {
+  mac: string;
+  name?: string;
+  rssi: number;
+}
+
+/** Streams HC900 devices as they are discovered, invoking onDevice per line. */
+export async function discoverScales(
+  onDevice: (d: DiscoveredScale) => void,
+  signal?: AbortSignal,
+  timeout = 15,
+): Promise<void> {
+  const res = await fetch(`/api/v1/integrations/scale/discover${qs({ timeout })}`, { signal });
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status}: ${text}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl = buf.indexOf('\n');
+    while (nl !== -1) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line) {
+        try {
+          onDevice(JSON.parse(line) as DiscoveredScale);
+        } catch {
+          // ignore malformed line; subprocess should only emit valid JSON
+        }
+      }
+      nl = buf.indexOf('\n');
+    }
+  }
+}

@@ -3,17 +3,19 @@
 Orchestrates a complete scale measurement import:
   1. Loads user profile (scale_profile.json + optional CLI overrides)
   2. Scans BLE for a stable HC900 reading
-  3. Calls the Pulso Dart decoder as a subprocess (decode_scale.dart)
+  3. Decodes the advertisement bytes natively via app.integrations.hc900
   4. Builds the normalised raw_payload with full audit fields
   5. POSTs to the Baseline ingestion API
+
+The decoder is Python-native (``hc900_ble_v2``); no Dart/Flutter toolchain
+is required. The raw advertisement bytes are preserved on the payload so
+future decoder revisions can reprocess historical measurements.
 
 Prerequisites:
   - PostgreSQL running and migrations applied:
         docker compose up -d && alembic upgrade head
   - Baseline API running:
         uvicorn app.main:app --reload
-  - Pulso app dependencies resolved:
-        cd C:/src/pulso/pulso-app && flutter pub get
   - User profile configured:
         cp scripts/scale_profile.json.example scripts/scale_profile.json
         # edit scale_profile.json with your biometric data
@@ -36,14 +38,12 @@ from pathlib import Path
 
 import httpx
 
+from app.integrations.hc900 import decode_hc900
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 _SCRIPTS_DIR = Path(__file__).parent
 _PROFILE_PATH = _SCRIPTS_DIR / "scale_profile.json"
-_PULSO_APP_DIR = Path(
-    os.environ.get("BASELINE_PULSO_APP_DIR", "C:/src/pulso/pulso-app")
-)
-_DART_CLI_NAME = "tools/decode_scale.dart"
 
 _DEFAULT_API_URL = os.environ.get("BASELINE_API_URL", "http://localhost:8000")
 _DEFAULT_USER_ID = os.environ.get("BASELINE_USER_ID")
@@ -69,11 +69,6 @@ def load_profile(
         with open(_PROFILE_PATH) as f:
             raw = json.load(f)
         profile = {k: v for k, v in raw.items() if not k.startswith("_")}
-    else:
-        logger.warning(
-            "scale_profile.json not found at %s — relying on CLI arguments only.",
-            _PROFILE_PATH,
-        )
 
     if height_cm is not None:
         profile["height_cm"] = height_cm
@@ -104,64 +99,31 @@ def calculate_age(birth_date: date, as_of: date) -> int:
     return age
 
 
-# ── Dart subprocess decoder ───────────────────────────────────────────────────
+# ── In-process decoder ────────────────────────────────────────────────────────
 
-async def call_dart_decoder(
+def decode_reading(
     mfr_weight: list[int],
     mfr_impedance: list[int] | None,
     height_cm: int,
     age: int,
     sex: int,
-    captured_at: datetime,
 ) -> dict:
-    """Call the Pulso Dart CLI and return the decoded measurement dict.
+    """Decode HC900 advertisement bytes into the full v2 measurement dict.
 
-    The Dart CLI (decode_scale.dart) is the single source of truth for the
-    HC900 decode algorithm and body-composition formulas.  This function is a
-    thin subprocess wrapper — Baseline never reimplements the protocol.
-
-    Raises:
-        FileNotFoundError: decode_scale.dart not found at expected path.
-        RuntimeError: Dart process exited with non-zero status.
+    Thin wrapper around :func:`app.integrations.hc900.decode_hc900` that
+    returns the serialisable dict form expected by the raw_payload
+    contract (``decoder_version`` + all primary/derived fields).  BMI and
+    BMR are populated from the profile even when impedance is absent;
+    body-composition fields stay ``None`` until impedance is captured.
     """
-    dart_cli = _PULSO_APP_DIR / _DART_CLI_NAME
-    if not dart_cli.exists():
-        raise FileNotFoundError(
-            f"Dart decoder not found at {dart_cli}. "
-            "Ensure the pulso-app project is at C:/src/pulso/pulso-app."
-        )
-
-    payload: dict = {
-        "mfr_weight": mfr_weight,
-        "height_cm": height_cm,
-        "age": age,
-        "sex": sex,
-        "captured_at": captured_at.isoformat(),
-    }
-    if mfr_impedance is not None:
-        payload["mfr_impedance"] = mfr_impedance
-
-    stdin_bytes = json.dumps(payload).encode()
-    logger.debug("[dart] sending: %s", json.dumps(payload))
-
-    proc = await asyncio.create_subprocess_exec(
-        "dart",
-        "run",
-        _DART_CLI_NAME,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(_PULSO_APP_DIR),
+    reading = decode_hc900(
+        mfr_weight,
+        mfr_impedance,
+        height_cm=height_cm,
+        age=age,
+        sex=sex,
     )
-    stdout, stderr_bytes = await proc.communicate(input=stdin_bytes)
-
-    if proc.returncode != 0:
-        err = stderr_bytes.decode().strip()
-        raise RuntimeError(f"Dart decoder failed (exit {proc.returncode}): {err}")
-
-    decoded = json.loads(stdout.decode().strip())
-    logger.debug("[dart] received: %s", decoded)
-    return decoded
+    return reading.to_dict()
 
 
 # ── External ID (deduplication key) ──────────────────────────────────────────
@@ -206,31 +168,32 @@ def build_raw_payload(
 ) -> dict:
     """Build the complete raw_payload dict for the Baseline ingestion API.
 
-    Temporal semantics (V1):
+    Temporal semantics (V2):
         captured_at  — when bleak captured the advertisement packets (machine clock, UTC)
         measured_at  — effective timestamp of the measurement
-                       V1: equals captured_at (explicit, not implicit)
+                       V2: equals captured_at (explicit, not implicit)
                        Future: may diverge if user manually sets measurement time
 
     Audit fields preserved:
         raw_mfr_*_hex          — original advertisement bytes for reprocessing
-        decoded                — exact output of the Dart decoder (with version)
+        decoded                — exact output of the native Python decoder
+                                 (decoder_version = 'hc900_ble_v2')
         user_profile_snapshot  — profile values used for body-comp calculation,
                                  frozen at measurement time (age changes — this captures it)
     """
     captured_at_iso = scan_result.captured_at.isoformat()
-    measured_at_iso = captured_at_iso  # V1: explicit equality
+    measured_at_iso = captured_at_iso  # V2: explicit equality
 
     def to_hex(b: list[int] | None) -> str | None:
         return "".join(f"{x:02x}" for x in b) if b else None
 
     return {
-        "format_version": "hc900_ble_v1",
+        "format_version": "hc900_ble_v2",
         "device_mac": scan_result.device_mac,
         "captured_at": captured_at_iso,
         "measured_at": measured_at_iso,
         "_measured_at_note": (
-            "V1: measured_at == captured_at. "
+            "V2: measured_at == captured_at. "
             "Future versions may allow manual time override."
         ),
         "capture_method": "bleak_scan",
@@ -288,7 +251,7 @@ async def run(args: argparse.Namespace) -> None:
 
     # scan_scale.py is in the same scripts/ directory — import by name
     sys.path.insert(0, str(_SCRIPTS_DIR))
-    from scan_scale import scan_for_reading  # noqa: PLC0415
+    from scan_scale import IncompleteMeasurementError, scan_for_reading  # noqa: PLC0415
 
     try:
         scan_result = await scan_for_reading(
@@ -296,6 +259,9 @@ async def run(args: argparse.Namespace) -> None:
             timeout=args.timeout,
         )
     except TimeoutError as e:
+        logger.error("%s", e)
+        sys.exit(1)
+    except IncompleteMeasurementError as e:
         logger.error("%s", e)
         sys.exit(1)
     except KeyboardInterrupt:
@@ -312,19 +278,18 @@ async def run(args: argparse.Namespace) -> None:
     birth = date.fromisoformat(profile["birth_date"])
     age = calculate_age(birth, scan_result.captured_at.date())
 
-    # 4. Dart decode (Pulso is the source of truth for the algorithm)
-    logger.info("Calling Pulso decoder …")
+    # 4. Decode (native Python decoder — app.integrations.hc900, v2 contract)
+    logger.info("Decoding advertisement bytes …")
     try:
-        decoded = await call_dart_decoder(
+        decoded = decode_reading(
             mfr_weight=scan_result.mfr_weight,
             mfr_impedance=scan_result.mfr_impedance,
             height_cm=int(profile["height_cm"]),
             age=age,
             sex=int(profile["sex"]),
-            captured_at=scan_result.captured_at,
         )
-    except (FileNotFoundError, RuntimeError) as e:
-        logger.error("Dart decoder error: %s", e)
+    except ValueError as e:
+        logger.error("Decoder error: %s", e)
         sys.exit(1)
 
     logger.info(
@@ -374,6 +339,14 @@ async def run(args: argparse.Namespace) -> None:
     if status == "failed":
         logger.error("Parser failed: %s", result.get("error_message"))
         sys.exit(1)
+
+    # User-facing completion line on stdout — the scan API returns stdout as
+    # the message shown in the UI, so this is what the user actually sees.
+    summary = f"Pesagem concluída: {decoded['weight_kg']:.1f} kg"
+    body_fat = decoded.get("body_fat_pct")
+    if body_fat is not None:
+        summary += f" • gordura {body_fat:.1f}%"
+    print(summary)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
