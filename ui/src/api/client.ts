@@ -10,6 +10,7 @@ import type {
   MedicationRegimenList,
   MedicationDefinitionResponse,
   LatestScaleReading,
+  SystemStatusResponse,
 } from './types';
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
@@ -134,6 +135,10 @@ export const deactivateRegimen = (regimenId: string, userId: string) =>
   apiFetch(`/medications/regimens/${regimenId}/deactivate${qs({ user_id: userId })}`, {
     method: 'PATCH',
   });
+
+// System Status
+export const fetchSystemStatus = (userId: string) =>
+  apiFetch<SystemStatusResponse>(`/status/system${qs({ user_id: userId })}`);
 
 // Integrations
 export interface ScaleProfileParams {

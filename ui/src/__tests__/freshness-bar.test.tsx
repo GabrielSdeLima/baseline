@@ -23,6 +23,7 @@ vi.mock('../api/client', async () => {
     fetchRecoveryStatus: vi.fn(),
     fetchSymptomLogs: vi.fn(),
     fetchActiveRegimens: vi.fn(),
+    fetchSystemStatus: vi.fn(),
     createCheckpoint: vi.fn(),
     createSymptomLog: vi.fn(),
     createMedicationLog: vi.fn(),
@@ -95,10 +96,18 @@ function renderFreshnessBar() {
   );
 }
 
+const emptySystemStatus = {
+  user_id: USER_ID,
+  sources: [] as import('../api/types').SystemSourceStatus[],
+  agents: [] as import('../api/types').SystemAgentSummary[],
+  as_of: new Date().toISOString(),
+};
+
 describe('FreshnessBar — per-source chips (A2)', () => {
   beforeEach(() => {
     vi.mocked(client.fetchMeasurements).mockResolvedValue(emptyMeasurements);
     vi.mocked(client.fetchCheckpoints).mockResolvedValue(emptyCheckpoints);
+    vi.mocked(client.fetchSystemStatus).mockResolvedValue(emptySystemStatus);
   });
 
   afterEach(() => vi.clearAllMocks());
@@ -177,6 +186,7 @@ describe('FreshnessBar — Scan button', () => {
   beforeEach(() => {
     vi.mocked(client.fetchMeasurements).mockResolvedValue(emptyMeasurements);
     vi.mocked(client.fetchCheckpoints).mockResolvedValue(emptyCheckpoints);
+    vi.mocked(client.fetchSystemStatus).mockResolvedValue(emptySystemStatus);
   });
   afterEach(() => vi.clearAllMocks());
 
@@ -247,5 +257,114 @@ describe('FreshnessBar — Scan button', () => {
     await waitFor(() => screen.getByRole('button', { name: /^scan$/i }));
     await user.click(screen.getByRole('button', { name: /^scan$/i }));
     await waitFor(() => expect(screen.getByText('Scale not found')).toBeInTheDocument());
+  });
+});
+
+describe('FreshnessBar — B1 System Status (agents + source annotations)', () => {
+  function localISO(daysAgo = 0): string {
+    const d = new Date();
+    d.setDate(d.getDate() - daysAgo);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T12:00:00`;
+  }
+
+  const TODAY_ISO = localISO(0);
+  const YESTERDAY_ISO = localISO(1);
+
+  beforeEach(() => {
+    vi.mocked(client.fetchMeasurements).mockResolvedValue(emptyMeasurements);
+    vi.mocked(client.fetchCheckpoints).mockResolvedValue(emptyCheckpoints);
+    vi.mocked(client.fetchSystemStatus).mockResolvedValue(emptySystemStatus);
+  });
+
+  afterEach(() => vi.clearAllMocks());
+
+  it('B1-F1: renders agent display_name when system status has agents', async () => {
+    vi.mocked(client.fetchSystemStatus).mockResolvedValue({
+      ...emptySystemStatus,
+      agents: [
+        {
+          agent_type: 'local_pc',
+          display_name: 'Desktop',
+          status: 'active',
+          last_seen_at: TODAY_ISO,
+        },
+      ],
+    });
+    renderFreshnessBar();
+    await waitFor(() => expect(screen.getByText('Desktop')).toBeInTheDocument());
+  });
+
+  it('B1-F2: falls back to agent_type when display_name is null', async () => {
+    vi.mocked(client.fetchSystemStatus).mockResolvedValue({
+      ...emptySystemStatus,
+      agents: [
+        {
+          agent_type: 'local_pc',
+          display_name: null,
+          status: 'stale',
+          last_seen_at: YESTERDAY_ISO,
+        },
+      ],
+    });
+    renderFreshnessBar();
+    await waitFor(() => expect(screen.getByText('local_pc')).toBeInTheDocument());
+  });
+
+  it('B1-F3: Garmin sync annotation appears when last_sync_at is set', async () => {
+    vi.mocked(client.fetchSystemStatus).mockResolvedValue({
+      ...emptySystemStatus,
+      sources: [
+        {
+          source_slug: 'garmin_connect',
+          integration_configured: true,
+          device_paired: null,
+          last_sync_at: YESTERDAY_ISO,
+          last_advanced_at: null,
+          last_run_status: 'completed',
+          last_run_at: YESTERDAY_ISO,
+        },
+      ],
+    });
+    renderFreshnessBar();
+    await waitFor(() => expect(screen.getByText(/sync yesterday/i)).toBeInTheDocument());
+  });
+
+  it('B1-F4: Garmin data annotation shows last_advanced_at when present', async () => {
+    vi.mocked(client.fetchSystemStatus).mockResolvedValue({
+      ...emptySystemStatus,
+      sources: [
+        {
+          source_slug: 'garmin_connect',
+          integration_configured: true,
+          device_paired: null,
+          last_sync_at: YESTERDAY_ISO,
+          last_advanced_at: TODAY_ISO,
+          last_run_status: 'completed',
+          last_run_at: YESTERDAY_ISO,
+        },
+      ],
+    });
+    renderFreshnessBar();
+    await waitFor(() => expect(screen.getByText(/data today/i)).toBeInTheDocument());
+  });
+
+  it('B1-F5: HC900 "no device" annotation when device_paired is false', async () => {
+    vi.mocked(client.fetchSystemStatus).mockResolvedValue({
+      ...emptySystemStatus,
+      sources: [
+        {
+          source_slug: 'hc900_ble',
+          integration_configured: true,
+          device_paired: false,
+          last_sync_at: null,
+          last_advanced_at: null,
+          last_run_status: null,
+          last_run_at: null,
+        },
+      ],
+    });
+    renderFreshnessBar();
+    await waitFor(() => expect(screen.getByText(/no device/i)).toBeInTheDocument());
   });
 });

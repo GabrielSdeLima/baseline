@@ -41,6 +41,7 @@ from app.services.insights import (
     InsightService,
     _classify_illness,
     _classify_recovery,
+    _worst_availability,
 )
 
 # ── Seed constants (mirrors scripts/seed.py) ──────────────────────────────
@@ -1122,4 +1123,1389 @@ async def test_api_unknown_user_returns_200_empty(client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["items"] == []
-    assert float(data["overall_adherence_pct"]) == 0.0
+    # B3: unknown user has no active regimens → not_applicable, overall is null.
+    assert data["overall_adherence_pct"] is None
+    assert data["availability_status"] == "not_applicable"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# J. Onda 2 / B1 — Availability-vs-signal schema separation
+# ═══════════════════════════════════════════════════════════════════════════
+
+_B1_RESPONSE_SCHEMAS = [
+    "MedicationAdherenceResponse",
+    "PhysiologicalDeviationsResponse",
+    "SymptomBurdenResponse",
+    "IllnessSignalResponse",
+    "RecoveryStatusResponse",
+    "InsightSummary",
+]
+
+_B1_AVAILABILITY_DOMAIN = {
+    "ok", "no_data", "no_data_today", "insufficient_data",
+    "stale_data", "partial", "not_applicable",
+}
+
+
+def _literal_values(annotation) -> set[str]:
+    """Extract string members of a Literal[...] (possibly under | None)."""
+    from typing import Literal, Union, get_args, get_origin
+    origin = get_origin(annotation)
+    if origin is Literal:
+        return {a for a in get_args(annotation) if isinstance(a, str)}
+    if origin is Union or (origin is type(None)):
+        for arg in get_args(annotation):
+            vals = _literal_values(arg)
+            if vals:
+                return vals
+    return set()
+
+
+def test_b1_availability_status_type_has_all_required_members():
+    from app.schemas.insights import AvailabilityStatus
+    members = _literal_values(AvailabilityStatus)
+    assert members == _B1_AVAILABILITY_DOMAIN, (
+        f"AvailabilityStatus missing/extra members: expected {_B1_AVAILABILITY_DOMAIN}, got {members}"
+    )
+
+
+def test_b1_availability_separate_from_signal_in_illness():
+    """IllnessSignalResponse must expose availability_status AND signal_status
+    as distinct fields.  Mixing the two into peak_signal was the false-all-clear
+    bug B1 is fixing."""
+    from app.schemas.insights import IllnessSignalResponse
+    fields = IllnessSignalResponse.model_fields
+    assert "availability_status" in fields
+    assert "signal_status" in fields
+    # signal_status must only admit genuine classifications — no availability leaks.
+    signal_members = _literal_values(fields["signal_status"].annotation)
+    assert signal_members == {"low", "moderate", "high"}, (
+        f"signal_status must be a pure signal Literal, got {signal_members}"
+    )
+    # availability_status must use the canonical availability domain.
+    avail_members = _literal_values(fields["availability_status"].annotation)
+    assert avail_members == _B1_AVAILABILITY_DOMAIN
+
+
+def test_b1_availability_separate_from_signal_in_recovery():
+    from app.schemas.insights import RecoveryStatusResponse
+    fields = RecoveryStatusResponse.model_fields
+    assert "current_availability_status" in fields
+    assert "current_signal_status" in fields
+    signal_members = _literal_values(fields["current_signal_status"].annotation)
+    assert signal_members == {"recovered", "recovering", "strained", "overreaching"}
+
+
+@pytest.mark.parametrize("schema_name", _B1_RESPONSE_SCHEMAS)
+def test_b1_response_schemas_have_data_availability(schema_name: str):
+    """Every insight response must carry a ``data_availability`` envelope."""
+    import app.schemas.insights as ins
+    cls = getattr(ins, schema_name)
+    assert "data_availability" in cls.model_fields, (
+        f"{schema_name} must expose data_availability (DataAvailability | None)"
+    )
+
+
+def test_b1_data_availability_distinguishes_measured_from_synced():
+    """Freshness of sync and freshness of measurement must be independent fields."""
+    from app.schemas.insights import DataAvailability
+    fields = DataAvailability.model_fields
+    for name in (
+        "latest_measured_at",
+        "latest_synced_at",
+        "has_data_for_target_date",
+        "target_date",
+        "missing_metrics",
+        "metrics_with_baseline",
+        "metrics_without_baseline",
+        "stale_metrics",
+    ):
+        assert name in fields, f"DataAvailability missing field {name!r}"
+
+
+def test_b1_medication_item_status_pending_first_log_exists():
+    from app.schemas.insights import MedicationAdherenceItem
+    fields = MedicationAdherenceItem.model_fields
+    assert "item_status" in fields
+    members = _literal_values(fields["item_status"].annotation)
+    assert "pending_first_log" in members, (
+        f"Medication items need a pending_first_log state, got {members}"
+    )
+
+
+def test_b1_summary_block_availability_covers_all_insights():
+    from app.schemas.insights import InsightSummary, SummaryBlockAvailability
+    assert "block_availability" in InsightSummary.model_fields
+    expected = {"deviations", "illness", "recovery", "adherence", "symptoms"}
+    actual = set(SummaryBlockAvailability.model_fields.keys())
+    assert expected == actual, (
+        f"SummaryBlockAvailability blocks: expected {expected}, got {actual}"
+    )
+
+
+def test_b1_defaults_are_backwards_compatible():
+    """Pre-B1 construction (only old fields) must still succeed; new fields
+    fall through to safe defaults so B2/B3 can fill them gradually."""
+    from app.schemas.insights import (
+        IllnessSignalResponse,
+        InsightSummary,
+        MedicationAdherenceResponse,
+        PhysiologicalDeviationsResponse,
+        RecoveryStatusResponse,
+        SymptomBurdenResponse,
+    )
+    uid = uuid.uuid4()
+    today = date.today()
+    r1 = MedicationAdherenceResponse(user_id=uid, items=[], overall_adherence_pct=Decimal("0"))
+    r2 = PhysiologicalDeviationsResponse(
+        user_id=uid, baseline_window_days=14, deviation_threshold=Decimal("2.0"),
+        deviations=[], metrics_flagged=0,
+    )
+    r3 = SymptomBurdenResponse(user_id=uid, days=[], total_symptom_days=0, peak_burden_date=None)
+    r4 = IllnessSignalResponse(
+        user_id=uid, method="baseline_deviation_v1",
+        days=[], peak_signal="insufficient_data", peak_signal_date=None,
+    )
+    r5 = RecoveryStatusResponse(
+        user_id=uid, method="load_hrv_heuristic_v1",
+        days=[], current_status="insufficient_data",
+    )
+    r6 = InsightSummary(
+        user_id=uid, as_of=today, overall_adherence_pct=Decimal("0"),
+        active_deviations=0, current_symptom_burden=Decimal("0"),
+        illness_signal="insufficient_data", recovery_status="insufficient_data",
+    )
+    for r in (r1, r2, r3, r5):
+        # availability_status top-level exists and defaults to "ok".
+        status_field = (
+            "current_availability_status" if hasattr(r, "current_availability_status")
+            else "availability_status"
+        )
+        assert getattr(r, status_field) == "ok"
+        assert r.data_availability is None
+    # Illness uses top-level availability_status.
+    assert r4.availability_status == "ok"
+    assert r4.signal_status is None  # set in B3 when data is sufficient
+    # Summary carries per-block availability defaulting to ok across the board.
+    for block in ("deviations", "illness", "recovery", "adherence", "symptoms"):
+        assert getattr(r6.block_availability, block) == "ok"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# K. Onda 2 / B2 — Availability and freshness guards at the service layer
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The helper in app.services.insight_availability classifies the data we have
+# access to.  These tests lock in the decision tree:
+#
+#   no measurement ever        → no_data
+#   fewer than BASELINE_MIN    → insufficient_data
+#   latest too old             → stale_data
+#   fresh but nothing on target → no_data_today
+#   otherwise                  → ok
+#
+# Partial coverage across required_metrics collapses to ``partial`` with
+# missing/with-baseline/without-baseline buckets populated.
+
+
+async def _seed_hrv(
+    db: AsyncSession,
+    user: User,
+    start: date,
+    values: list[float],
+) -> None:
+    """Insert HRV measurements starting at ``start``, one per consecutive day."""
+    lk = await _resolve_lookups(db)
+    mt = lk["metrics"]["hrv_rmssd"]
+    src = lk["sources"]["manual"]
+    for i, val in enumerate(values):
+        d = start + timedelta(days=i)
+        db.add(Measurement(
+            id=uuid7(), user_id=user.id,
+            metric_type_id=mt.id, source_id=src.id,
+            value_num=Decimal(str(val)), unit="ms",
+            measured_at=datetime(d.year, d.month, d.day, 7, tzinfo=UTC),
+            recorded_at=datetime(d.year, d.month, d.day, 7, tzinfo=UTC),
+            aggregation_level="spot",
+        ))
+    await db.flush()
+
+
+async def test_b2_recovery_no_data_returns_no_data(db: AsyncSession, user: User):
+    """Zero HRV measurements → recovery availability = no_data, signal = None."""
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    assert resp.current_availability_status == "no_data"
+    assert resp.current_signal_status is None
+    assert resp.current_status == "insufficient_data"
+    assert resp.data_availability is not None
+    assert resp.data_availability.availability_status == "no_data"
+    assert resp.data_availability.has_data_for_target_date is False
+    assert resp.data_availability.missing_metrics == ["hrv_rmssd"]
+
+
+async def test_b2_recovery_one_day_returns_insufficient_data(
+    db: AsyncSession, user: User
+):
+    """A single HRV measurement can't form a baseline → insufficient_data."""
+    await _seed_hrv(db, user, date.today() - timedelta(days=1), [42.0])
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    assert resp.current_availability_status == "insufficient_data"
+    assert resp.current_signal_status is None
+    assert resp.data_availability.metrics_without_baseline == ["hrv_rmssd"]
+
+
+async def test_b2_recovery_baseline_below_min_returns_insufficient_data(
+    db: AsyncSession, user: User
+):
+    """Two days of data still short of the three-point baseline minimum."""
+    await _seed_hrv(db, user, date.today() - timedelta(days=2), [40.0, 42.0])
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    assert resp.current_availability_status == "insufficient_data"
+
+
+async def test_b2_recovery_fresh_baseline_no_data_today_flags_no_data_today(
+    db: AsyncSession, user: User
+):
+    """Baseline satisfied and latest measurement within budget but target
+    date has no row → no_data_today (distinct from stale_data)."""
+    today = date.today()
+    # Four points spanning [today-4, today-1]; latest is yesterday (within
+    # the 2-day HRV budget) and baseline_points reaches 3 on the last day.
+    await _seed_hrv(db, user, today - timedelta(days=4), [40.0, 41.0, 42.0, 43.0])
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    assert resp.current_availability_status == "no_data_today"
+    assert resp.current_signal_status is None
+    assert resp.data_availability.has_data_for_target_date is False
+    # The metric has a baseline — it shows up under metrics_with_baseline.
+    assert "hrv_rmssd" in resp.data_availability.metrics_with_baseline
+
+
+async def test_b2_recovery_stale_data_when_latest_beyond_budget(
+    db: AsyncSession, user: User
+):
+    """Baseline exists but latest measurement is well past the 2-day HRV
+    staleness budget → stale_data."""
+    today = date.today()
+    # Baseline 30 days old — far beyond the 2-day HRV budget.
+    await _seed_hrv(db, user, today - timedelta(days=30), [40.0, 41.0, 42.0, 43.0])
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    assert resp.current_availability_status == "stale_data"
+    assert resp.current_signal_status is None
+    assert resp.data_availability.stale_metrics == ["hrv_rmssd"]
+
+
+async def test_b2_illness_partial_when_body_temperature_missing(
+    db: AsyncSession, user: User
+):
+    """HRV + resting_hr present, body_temperature absent → partial.
+    body_temperature appears in missing_metrics; the other two fall under
+    metrics_with_baseline."""
+    lk = await _resolve_lookups(db)
+    src = lk["sources"]["manual"]
+    today = date.today()
+    # Seed HRV and resting_hr fresh enough to satisfy availability for each.
+    for slug, unit, base in [("hrv_rmssd", "ms", 40.0), ("resting_hr", "bpm", 58.0)]:
+        mt = lk["metrics"][slug]
+        for offset in range(3):
+            d = today - timedelta(days=offset)
+            db.add(Measurement(
+                id=uuid7(), user_id=user.id,
+                metric_type_id=mt.id, source_id=src.id,
+                value_num=Decimal(str(base + offset)), unit=unit,
+                measured_at=datetime(d.year, d.month, d.day, 7, tzinfo=UTC),
+                recorded_at=datetime(d.year, d.month, d.day, 7, tzinfo=UTC),
+                aggregation_level="spot",
+            ))
+    await db.flush()
+
+    svc = InsightService(db)
+    resp = await svc.illness_signal(user.id)
+    # Mixed states: body_temperature missing, other two ok → partial.
+    assert resp.availability_status == "partial"
+    assert resp.signal_status is None  # availability ≠ ok → no signal leak
+    assert "body_temperature" in resp.data_availability.missing_metrics
+    assert set(resp.data_availability.metrics_with_baseline) == {
+        "hrv_rmssd", "resting_hr"
+    }
+
+
+async def test_b2_illness_no_data_when_all_metrics_missing(
+    db: AsyncSession, user: User
+):
+    """None of the illness metrics recorded → uniform no_data aggregation."""
+    svc = InsightService(db)
+    resp = await svc.illness_signal(user.id)
+    assert resp.availability_status == "no_data"
+    assert resp.signal_status is None
+    assert set(resp.data_availability.missing_metrics) == {
+        "body_temperature", "hrv_rmssd", "resting_hr"
+    }
+
+
+async def test_b2_deviations_empty_does_not_mask_insufficient_baseline(
+    db: AsyncSession, user: User
+):
+    """Physiological deviations with no flagged metrics must not report
+    availability_status = ok when the user lacks enough data to form a
+    baseline.  This prevents the Home screen from showing "all clear"
+    when there is nothing to be clear about."""
+    await _seed_hrv(db, user, date.today() - timedelta(days=1), [42.0])
+    svc = InsightService(db)
+    resp = await svc.physiological_deviations(user.id)
+    assert resp.metrics_flagged == 0
+    assert resp.availability_status != "ok"
+    assert resp.availability_status in ("insufficient_data", "no_data")
+
+
+async def test_b2_deviations_no_data_when_user_has_no_measurements(
+    db: AsyncSession, user: User
+):
+    """A user with zero measurements gets availability_status = no_data."""
+    svc = InsightService(db)
+    resp = await svc.physiological_deviations(user.id)
+    assert resp.availability_status == "no_data"
+    assert resp.data_availability.has_data_for_target_date is False
+
+
+async def test_b2_recovery_does_not_use_yesterday_as_current(
+    db: AsyncSession, user: User
+):
+    """Target_date = today but latest data is yesterday → current signal
+    must be None, not yesterday's classification.  This is the precise
+    false-all-clear bug B2 closes."""
+    today = date.today()
+    # Four HRV days ending yesterday — the 4th day produces baseline_points=3,
+    # so the view emits exactly one row (yesterday) that the old code would
+    # have surfaced as the "current" recovery state.
+    await _seed_hrv(db, user, today - timedelta(days=4), [40.0, 41.0, 42.0, 43.0])
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    assert resp.days, "yesterday must produce a classified row for this test"
+    yesterday_status = resp.days[-1].status
+    assert yesterday_status in (
+        "recovered", "recovering", "strained", "overreaching"
+    ), f"Expected a real classification, got {yesterday_status}"
+    # Target is today with no row — current must NOT inherit yesterday's value.
+    assert resp.current_availability_status == "no_data_today"
+    assert resp.current_signal_status is None
+    assert resp.current_status == "insufficient_data"
+
+
+async def test_b2_data_availability_separates_measured_from_synced(
+    db: AsyncSession, user: User
+):
+    """latest_measured_at reflects data time; latest_synced_at reflects the
+    last cursor advance.  They must be independent fields.  With no source
+    cursor written, latest_synced_at is None even when measurements exist."""
+    today = date.today()
+    await _seed_hrv(db, user, today - timedelta(days=2), [40.0, 41.0, 42.0])
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    # latest_measured_at reflects the HRV seed — today (latest day seeded).
+    assert resp.data_availability.latest_measured_at is not None
+    assert resp.data_availability.latest_measured_at.date() == today
+    # No source_cursor row written → latest_synced_at is None, independent.
+    assert resp.data_availability.latest_synced_at is None
+
+
+async def test_b2_illness_fresh_signal_is_exposed(db: AsyncSession, user: User):
+    """When availability is ok and the heuristic produces a non-insufficient
+    signal, signal_status mirrors peak_signal.  Guards against an
+    overzealous B2 that nullifies everything."""
+    lk = await _resolve_lookups(db)
+    src = lk["sources"]["manual"]
+    today = date.today()
+    # Seed four days of stable data per metric — the view needs 3 prior
+    # points to emit a non-NULL z_score, so today's row requires 4 total
+    # observations.  Values are near-constant so the z_score lands firmly
+    # inside the "low" band.
+    seed = [
+        ("hrv_rmssd", "ms", [45.0, 45.1, 45.0, 45.0]),
+        ("resting_hr", "bpm", [58.0, 58.0, 58.0, 58.0]),
+        ("body_temperature", "°C", [36.4, 36.5, 36.4, 36.4]),
+    ]
+    for slug, unit, vals in seed:
+        mt = lk["metrics"][slug]
+        for offset, val in enumerate(vals):
+            d = today - timedelta(days=3 - offset)
+            db.add(Measurement(
+                id=uuid7(), user_id=user.id,
+                metric_type_id=mt.id, source_id=src.id,
+                value_num=Decimal(str(val)), unit=unit,
+                measured_at=datetime(d.year, d.month, d.day, 7, tzinfo=UTC),
+                recorded_at=datetime(d.year, d.month, d.day, 7, tzinfo=UTC),
+                aggregation_level="spot",
+            ))
+    await db.flush()
+
+    svc = InsightService(db)
+    resp = await svc.illness_signal(user.id)
+    assert resp.availability_status == "ok"
+    # With flat data and no burden the signal lands at "low".
+    assert resp.peak_signal == "low"
+    assert resp.signal_status == "low"
+
+
+async def test_b2_summary_block_availability_reflects_sources(
+    db: AsyncSession, user: User
+):
+    """Summary's block_availability must mirror each underlying response —
+    not collapse to a single "ok" when some blocks have no data."""
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+    # A brand-new user has no deviations, illness, or recovery data.
+    assert resp.block_availability.deviations == "no_data"
+    assert resp.block_availability.illness == "no_data"
+    assert resp.block_availability.recovery == "no_data"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# L. Onda 2 / B3 — Insight-specific corrections
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Validates the corrected heuristic rules:
+#   Illness  — body_temperature governs HIGH; partial still exposes moderate.
+#   Recovery — no signal without HRV on target_date.
+#   Medication — LEFT JOIN surfaces regimens with no logs; not_applicable
+#               when no active regimens.
+#   Symptom  — tracking_ever_used distinguishes absence from quiet.
+
+
+# ── L-1. Illness signal ────────────────────────────────────────────────────
+
+async def _seed_metric_with_baseline(
+    db: AsyncSession,
+    user: User,
+    metric_slug: str,
+    unit: str,
+    baseline_values: list[float],
+    today_value: float,
+) -> None:
+    """Seed *baseline_values* on consecutive days ending yesterday, then
+    *today_value* today — giving the view enough prior points to emit a
+    z_score for today."""
+    lk = await _resolve_lookups(db)
+    mt = lk["metrics"][metric_slug]
+    src = lk["sources"]["manual"]
+    n = len(baseline_values)
+    # baseline days: today-(n) … today-1
+    for i, val in enumerate(baseline_values):
+        d = date.today() - timedelta(days=n - i)
+        db.add(Measurement(
+            id=uuid7(), user_id=user.id,
+            metric_type_id=mt.id, source_id=src.id,
+            value_num=Decimal(str(val)), unit=unit,
+            measured_at=datetime(d.year, d.month, d.day, 7, tzinfo=UTC),
+            recorded_at=datetime(d.year, d.month, d.day, 7, tzinfo=UTC),
+            aggregation_level="spot",
+        ))
+    # today's value
+    d = date.today()
+    db.add(Measurement(
+        id=uuid7(), user_id=user.id,
+        metric_type_id=mt.id, source_id=src.id,
+        value_num=Decimal(str(today_value)), unit=unit,
+        measured_at=datetime(d.year, d.month, d.day, 7, tzinfo=UTC),
+        recorded_at=datetime(d.year, d.month, d.day, 7, tzinfo=UTC),
+        aggregation_level="spot",
+    ))
+    await db.flush()
+
+
+async def test_b3_illness_partial_with_hrv_rhr_bad_exposes_moderate(
+    db: AsyncSession, user: User
+):
+    """HRV and RHR strongly deviate but body_temperature is absent.
+    The signal must be at most ``moderate`` (never ``high``) and
+    ``signal_status`` must surface it — not be null — because partial
+    availability still carries a caveated signal."""
+    # Baseline: HRV 40-48, today 28 → deeply negative z.
+    await _seed_metric_with_baseline(
+        db, user, "hrv_rmssd", "ms",
+        [40.0, 42.0, 44.0, 46.0, 48.0], today_value=28.0,
+    )
+    # Baseline: RHR 58-62, today 80 → strongly positive z.
+    await _seed_metric_with_baseline(
+        db, user, "resting_hr", "bpm",
+        [58.0, 59.0, 60.0, 61.0, 62.0], today_value=80.0,
+    )
+    # body_temperature: no measurements at all.
+    svc = InsightService(db)
+    resp = await svc.illness_signal(user.id)
+    assert resp.availability_status == "partial"
+    assert "body_temperature" in resp.data_availability.missing_metrics
+    # HIGH is impossible without body_temperature; at most moderate.
+    assert resp.signal_status in ("low", "moderate")
+    assert resp.signal_status != "high"
+    # The per-day signal_level and peak_signal legacy fields are unchanged.
+    assert resp.peak_signal in ("low", "moderate", "high", "insufficient_data")
+
+
+async def test_b3_illness_no_critical_metrics_returns_no_data(
+    db: AsyncSession, user: User
+):
+    """Zero measurements for all illness metrics → no_data, signal None."""
+    svc = InsightService(db)
+    resp = await svc.illness_signal(user.id)
+    assert resp.availability_status == "no_data"
+    assert resp.signal_status is None
+    assert set(resp.data_availability.missing_metrics) == {
+        "body_temperature", "hrv_rmssd", "resting_hr"
+    }
+
+
+async def test_b3_illness_all_critical_present_classifies_normally(
+    db: AsyncSession, user: User
+):
+    """All three illness metrics fresh and stable → ok, signal exposed."""
+    for slug, unit in [
+        ("hrv_rmssd", "ms"), ("resting_hr", "bpm"), ("body_temperature", "°C")
+    ]:
+        vals = [45.0, 45.1, 45.0, 45.0, 45.0]
+        await _seed_metric_with_baseline(db, user, slug, unit, vals, 45.0)
+    svc = InsightService(db)
+    resp = await svc.illness_signal(user.id)
+    assert resp.availability_status == "ok"
+    assert resp.signal_status in ("low", "moderate", "high")
+    # peak_signal legacy field is still set.
+    assert resp.peak_signal in ("low", "moderate", "high", "insufficient_data")
+
+
+async def test_b3_illness_high_never_emitted_via_signal_status_without_body_temp(
+    db: AsyncSession, user: User
+):
+    """Even if the per-day _classify_illness would want HIGH (extreme HRV/RHR
+    values) the signal_status cap on partial must prevent it — partial allows
+    at most moderate."""
+    await _seed_metric_with_baseline(
+        db, user, "hrv_rmssd", "ms",
+        [45.0, 45.0, 45.0, 45.0, 45.0], today_value=10.0,  # very low HRV
+    )
+    await _seed_metric_with_baseline(
+        db, user, "resting_hr", "bpm",
+        [60.0, 60.0, 60.0, 60.0, 60.0], today_value=110.0,  # very high RHR
+    )
+    # body_temperature absent — we cannot emit HIGH.
+    svc = InsightService(db)
+    resp = await svc.illness_signal(user.id)
+    assert resp.availability_status == "partial"
+    assert resp.signal_status != "high", (
+        f"signal_status must not be 'high' without body_temperature, got {resp.signal_status!r}"
+    )
+
+
+# ── L-2. Recovery status ───────────────────────────────────────────────────
+
+async def test_b3_recovery_hrv_ok_load_absent_classifies(
+    db: AsyncSession, user: User
+):
+    """When HRV baseline is valid and data is fresh, recovery classifies
+    correctly even without training load data — load is optional."""
+    # Six HRV days ending today; today's value exceeds the baseline avg.
+    await _seed_metric_with_baseline(
+        db, user, "hrv_rmssd", "ms",
+        [40.0, 42.0, 44.0, 46.0, 48.0], today_value=52.0,
+    )
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    assert resp.current_availability_status == "ok"
+    # z_score > 0 → recovered
+    assert resp.current_signal_status == "recovered"
+    assert resp.current_status == "recovered"
+
+
+async def test_b3_recovery_hrv_absent_load_present_returns_no_data(
+    db: AsyncSession, user: User
+):
+    """Training load exists but no HRV → cannot assess recovery.
+    Availability must be no_data, signal must be None."""
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    assert resp.current_availability_status == "no_data"
+    assert resp.current_signal_status is None
+    assert resp.current_status == "insufficient_data"
+
+
+async def test_b3_recovery_hrv_stale_blocks_signal(
+    db: AsyncSession, user: User
+):
+    """HRV baseline exists but latest measurement is older than the 2-day
+    staleness budget → stale_data, no current signal."""
+    today = date.today()
+    await _seed_hrv(db, user, today - timedelta(days=30), [40.0, 41.0, 42.0, 43.0])
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    assert resp.current_availability_status == "stale_data"
+    assert resp.current_signal_status is None
+
+
+async def test_b3_recovery_hrv_fresh_today_exposes_recovered(
+    db: AsyncSession, user: User
+):
+    """HRV data for today with z_score >= 0 → current_signal_status = recovered."""
+    await _seed_metric_with_baseline(
+        db, user, "hrv_rmssd", "ms",
+        [40.0, 41.0, 42.0, 43.0, 44.0], today_value=50.0,  # above baseline
+    )
+    svc = InsightService(db)
+    resp = await svc.recovery_status(user.id)
+    assert resp.current_availability_status == "ok"
+    assert resp.current_signal_status == "recovered"
+    assert resp.current_status == "recovered"
+
+
+# ── L-3. Medication adherence ──────────────────────────────────────────────
+
+async def test_b3_medication_no_active_regimens_is_not_applicable(
+    db: AsyncSession, user: User
+):
+    """A user with no active regimens must get not_applicable — not 0%."""
+    svc = InsightService(db)
+    resp = await svc.medication_adherence(user.id)
+    assert resp.availability_status == "not_applicable"
+    assert resp.items == []
+    assert resp.overall_adherence_pct is None
+
+
+async def test_b3_medication_active_regimen_no_logs_pending_first_log(
+    db: AsyncSession, user: User
+):
+    """An active regimen that has never been logged must appear as
+    pending_first_log, not vanish from the response."""
+    med_def = MedicationDefinition(name="Vitamin D", dosage_form="tablet")
+    db.add(med_def)
+    await db.flush()
+    db.add(MedicationRegimen(
+        id=uuid7(), user_id=user.id, medication_id=med_def.id,
+        dosage_amount=Decimal("1"), dosage_unit="tablet",
+        frequency="daily", started_at=date.today(),
+    ))
+    await db.flush()
+    svc = InsightService(db)
+    resp = await svc.medication_adherence(user.id)
+    # Opção B: pending_first_log ⇒ partial (regimen active but no data yet)
+    assert resp.availability_status == "partial"
+    assert len(resp.items) == 1
+    item = resp.items[0]
+    assert item.item_status == "pending_first_log"
+    assert item.adherence_pct is None
+    assert item.total == 0
+    # overall is None when no logs exist for any regimen.
+    assert resp.overall_adherence_pct is None
+
+
+async def test_b3_medication_active_regimen_with_logs_computes_adherence(
+    db: AsyncSession, user: User
+):
+    """Active regimen with logs → normal adherence calculation, item_status ok."""
+    med_def = MedicationDefinition(name="Magnesium", dosage_form="capsule")
+    db.add(med_def)
+    await db.flush()
+    regimen = MedicationRegimen(
+        id=uuid7(), user_id=user.id, medication_id=med_def.id,
+        dosage_amount=Decimal("400"), dosage_unit="mg",
+        frequency="daily", started_at=date(2026, 4, 1),
+    )
+    db.add(regimen)
+    await db.flush()
+    # 3 taken, 1 skipped → 75%
+    for i, status in enumerate(["taken", "taken", "taken", "skipped"]):
+        d = date(2026, 4, 1) + timedelta(days=i)
+        db.add(MedicationLog(
+            id=uuid7(), user_id=user.id, regimen_id=regimen.id,
+            status=status, scheduled_at=_dt(d, 8),
+            taken_at=_dt(d, 8) if status == "taken" else None,
+            recorded_at=_dt(d, 8),
+        ))
+    await db.flush()
+    svc = InsightService(db)
+    resp = await svc.medication_adherence(user.id)
+    assert resp.availability_status == "ok"
+    assert len(resp.items) == 1
+    item = resp.items[0]
+    assert item.item_status == "ok"
+    assert item.adherence_pct == Decimal("75.0")
+    assert resp.overall_adherence_pct == Decimal("75.0")
+
+
+async def test_b3_medication_no_regimens_not_same_as_zero_adherence(
+    db: AsyncSession, user: User
+):
+    """Distinguishes not_applicable (no regimens) from 0% adherence (regimen
+    exists but all events are skipped)."""
+    # No regimens at all → not_applicable.
+    svc = InsightService(db)
+    no_regimen_resp = await svc.medication_adherence(user.id)
+    assert no_regimen_resp.availability_status == "not_applicable"
+    assert no_regimen_resp.overall_adherence_pct is None
+
+    # Create a regimen with only skipped logs → 0% adherence.
+    med_def = MedicationDefinition(name="Iron", dosage_form="tablet")
+    db.add(med_def)
+    await db.flush()
+    regimen = MedicationRegimen(
+        id=uuid7(), user_id=user.id, medication_id=med_def.id,
+        dosage_amount=Decimal("1"), dosage_unit="tablet",
+        frequency="daily", started_at=date(2026, 4, 1),
+    )
+    db.add(regimen)
+    await db.flush()
+    d = date(2026, 4, 1)
+    db.add(MedicationLog(
+        id=uuid7(), user_id=user.id, regimen_id=regimen.id,
+        status="skipped", scheduled_at=_dt(d, 8), taken_at=None,
+        recorded_at=_dt(d, 8),
+    ))
+    await db.flush()
+    regimen_resp = await svc.medication_adherence(user.id)
+    assert regimen_resp.availability_status == "ok"
+    assert regimen_resp.overall_adherence_pct == Decimal("0.0")
+
+
+# ── L-4. Symptom burden ────────────────────────────────────────────────────
+
+async def test_b3_symptom_never_used_is_not_applicable(db: AsyncSession, user: User):
+    """A user who has never logged a symptom gets tracking_ever_used=False
+    and availability_status=not_applicable — not a blank 'all clear'."""
+    svc = InsightService(db)
+    resp = await svc.symptom_burden(user.id)
+    assert resp.tracking_ever_used is False
+    assert resp.availability_status == "not_applicable"
+    assert resp.days == []
+
+
+async def test_b3_symptom_historical_user_no_logs_today_is_ok(
+    db: AsyncSession, user: User
+):
+    """A user with prior symptom logs but none today gets tracking_ever_used=True
+    and availability_status=ok — burden=0 is a valid 'quiet day' signal."""
+    lk = await _resolve_lookups(db)
+    past_day = date.today() - timedelta(days=5)
+    db.add(SymptomLog(
+        id=uuid7(), user_id=user.id,
+        symptom_id=lk["symptoms"]["headache"].id,
+        intensity=4, status="active",
+        started_at=datetime(past_day.year, past_day.month, past_day.day, 9, tzinfo=UTC),
+        ended_at=datetime(past_day.year, past_day.month, past_day.day, 20, tzinfo=UTC),
+        recorded_at=datetime(past_day.year, past_day.month, past_day.day, 9, tzinfo=UTC),
+    ))
+    await db.flush()
+    svc = InsightService(db)
+    resp = await svc.symptom_burden(user.id)
+    assert resp.tracking_ever_used is True
+    assert resp.availability_status == "ok"
+
+
+async def test_b3_symptom_with_logs_today_is_ok_with_burden(
+    db: AsyncSession, user: User
+):
+    """Symptom logs today → tracking_ever_used=True, ok, burden > 0."""
+    lk = await _resolve_lookups(db)
+    today = date.today()
+    db.add(SymptomLog(
+        id=uuid7(), user_id=user.id,
+        symptom_id=lk["symptoms"]["fatigue"].id,
+        intensity=6, status="active",
+        started_at=datetime(today.year, today.month, today.day, 7, tzinfo=UTC),
+        ended_at=datetime(today.year, today.month, today.day, 20, tzinfo=UTC),
+        recorded_at=datetime(today.year, today.month, today.day, 7, tzinfo=UTC),
+    ))
+    await db.flush()
+    svc = InsightService(db)
+    resp = await svc.symptom_burden(user.id)
+    assert resp.tracking_ever_used is True
+    assert resp.availability_status == "ok"
+    today_days = [d for d in resp.days if d.day == today]
+    assert today_days and today_days[0].weighted_burden > 0
+
+
+async def test_b3_summary_symptoms_not_applicable_when_never_used(
+    db: AsyncSession, user: User
+):
+    """Summary block_availability.symptoms must be not_applicable for a
+    user who has never engaged with symptom tracking."""
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+    assert resp.block_availability.symptoms == "not_applicable"
+    # Medication also not_applicable (no regimens).
+    assert resp.block_availability.adherence == "not_applicable"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# M. Onda 2 / B4 — Summary correctness: aggregation does not mask absence
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Tests the `summary()` end-to-end.  Every test checks both the legacy
+# scalar fields (backward compat) and the new availability envelope so
+# both consumers are validated simultaneously.
+
+
+# ── M-1. No data at all ───────────────────────────────────────────────────
+
+async def test_b4_summary_no_data_blocks_and_availability(
+    db: AsyncSession, user: User
+):
+    """A brand-new user with zero measurements must not show any 'all clear'
+    in the summary.  Every physiological block must signal absence."""
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+
+    # Physiological blocks: no data.
+    assert resp.block_availability.deviations == "no_data"
+    assert resp.block_availability.illness == "no_data"
+    assert resp.block_availability.recovery == "no_data"
+    # Optional/voluntary blocks: not_applicable (expected, not a warning).
+    assert resp.block_availability.adherence == "not_applicable"
+    assert resp.block_availability.symptoms == "not_applicable"
+
+    # Aggregate availability must reflect the worst physiological block.
+    assert resp.data_availability is not None
+    assert resp.data_availability.availability_status != "ok"
+    assert resp.data_availability.availability_status == "no_data"
+    assert resp.data_availability.has_data_for_target_date is False
+
+    # Legacy fields stay structurally sound.
+    assert resp.illness_signal == "insufficient_data"
+    assert resp.recovery_status == "insufficient_data"
+    assert resp.active_deviations == 0
+    assert resp.overall_adherence_pct is None
+
+
+# ── M-2. Baseline insufficient ────────────────────────────────────────────
+
+async def test_b4_summary_insufficient_baseline_not_all_clear(
+    db: AsyncSession, user: User
+):
+    """One day of HRV data — below the 3-point baseline minimum.
+    active_deviations=0 must not imply 'ok': the deviations block must
+    expose insufficient_data."""
+    await _seed_hrv(db, user, date.today(), [42.0])  # single day, no baseline
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+
+    assert resp.active_deviations == 0
+    assert resp.block_availability.deviations != "ok"
+    assert resp.data_availability.availability_status != "ok"
+    # HRV exists (1 measurement) but baseline is insufficient.
+    assert resp.block_availability.recovery in ("insufficient_data", "no_data_today")
+
+
+# ── M-3. Historical data exists but nothing today ─────────────────────────
+
+async def test_b4_summary_no_data_today_blocks_positive_read(
+    db: AsyncSession, user: User
+):
+    """Baseline is valid (4 days of HRV ending yesterday) but today has no
+    new measurement.  active_deviations=0 is not an 'all clear' — the
+    recovery block must flag no_data_today and has_data_for_target_date
+    must be False."""
+    today = date.today()
+    await _seed_hrv(db, user, today - timedelta(days=4), [40.0, 41.0, 42.0, 43.0])
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+
+    assert resp.block_availability.recovery == "no_data_today"
+    assert resp.data_availability.has_data_for_target_date is False
+    # aggregate picks up the no_data_today severity.
+    assert resp.data_availability.availability_status in (
+        "no_data_today", "no_data", "stale_data", "insufficient_data"
+    )
+    # legacy field falls back to insufficient_data (not a real recovery signal).
+    assert resp.recovery_status == "insufficient_data"
+
+
+# ── M-4. Illness partial when body_temperature absent ─────────────────────
+
+async def test_b4_summary_illness_partial_body_temp_absent(
+    db: AsyncSession, user: User
+):
+    """HRV and resting_hr are fresh and valid; body_temperature is absent.
+    The illness block must be partial.  signal_status must not be 'high'."""
+    await _seed_metric_with_baseline(
+        db, user, "hrv_rmssd", "ms",
+        [45.0, 45.1, 45.0, 45.0, 45.0], today_value=45.0,
+    )
+    await _seed_metric_with_baseline(
+        db, user, "resting_hr", "bpm",
+        [60.0, 60.0, 60.0, 60.0, 60.0], today_value=60.0,
+    )
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+
+    assert resp.block_availability.illness == "partial"
+    # Aggregate sees partial on illness — not ok.
+    assert resp.data_availability.availability_status in ("partial", "no_data")
+    # Illness signal must NOT be reported as a clean 'low' without caveat.
+    # peak_signal (legacy) can still hold a value; signal_status for detail.
+    illness = await InsightService(db).illness_signal(user.id)
+    assert illness.signal_status != "high"
+
+
+# ── M-5. Recovery stale — legacy field falls back correctly ───────────────
+
+async def test_b4_summary_recovery_stale_legacy_fallback(
+    db: AsyncSession, user: User
+):
+    """HRV baseline exists but is 30 days old (beyond 2-day budget) →
+    stale_data.  The legacy recovery_status must be 'insufficient_data',
+    not 'recovered' or any real classification."""
+    today = date.today()
+    await _seed_hrv(db, user, today - timedelta(days=30), [40.0, 41.0, 42.0, 43.0])
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+
+    assert resp.block_availability.recovery == "stale_data"
+    assert resp.recovery_status == "insufficient_data"
+    assert resp.data_availability.availability_status in (
+        "stale_data", "no_data", "stale_data"
+    )
+
+
+# ── M-6. No medication regimens ───────────────────────────────────────────
+
+async def test_b4_summary_no_medication_regimens_not_applicable(
+    db: AsyncSession, user: User
+):
+    """No active regimens → adherence block = not_applicable.
+    overall_adherence_pct must be None, not 0%.  not_applicable must NOT
+    worsen the physiological availability aggregate."""
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+
+    assert resp.block_availability.adherence == "not_applicable"
+    assert resp.overall_adherence_pct is None
+    # not_applicable does not pull the aggregate below the physiological worst.
+    # (no physiological data either, so aggregate = no_data anyway here)
+    assert resp.data_availability.availability_status == "no_data"
+
+
+# ── M-7. Active regimen with no logs ──────────────────────────────────────
+
+async def test_b4_summary_active_regimen_no_logs_not_applicable(
+    db: AsyncSession, user: User
+):
+    """An active regimen with zero logs must show adherence block = ok
+    (the feature IS in use) but overall_adherence_pct = None (no data yet)."""
+    med_def = MedicationDefinition(name="Test Supplement", dosage_form="tablet")
+    db.add(med_def)
+    await db.flush()
+    db.add(MedicationRegimen(
+        id=uuid7(), user_id=user.id, medication_id=med_def.id,
+        dosage_amount=Decimal("1"), dosage_unit="tablet",
+        frequency="daily", started_at=date.today(),
+    ))
+    await db.flush()
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+
+    # Block must be 'partial' (Opção B: active regimen with pending_first_log
+    # is not 'ok' — logs haven't started yet).
+    assert resp.block_availability.adherence == "partial"
+    # But no logs → overall is still None.
+    assert resp.overall_adherence_pct is None
+
+
+# ── M-8. Symptom tracking never used ─────────────────────────────────────
+
+async def test_b4_summary_symptom_never_used_not_applicable(
+    db: AsyncSession, user: User
+):
+    """A user who has never logged a symptom gets symptom block = not_applicable.
+    burden=0 must not be presented as a clean 'no symptoms today'."""
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+
+    assert resp.block_availability.symptoms == "not_applicable"
+    assert resp.current_symptom_burden == Decimal("0")
+    # not_applicable does not worsen the overall physiological aggregate.
+    # (no physiological data → aggregate = no_data regardless)
+    burden = await InsightService(db).symptom_burden(user.id)
+    assert burden.tracking_ever_used is False
+    assert burden.availability_status == "not_applicable"
+
+
+# ── M-9. Symptom tracking used before, quiet today ───────────────────────
+
+async def test_b4_summary_symptom_used_before_quiet_today(
+    db: AsyncSession, user: User
+):
+    """Symptom history exists (5 days ago) but nothing today.
+    symptom block = ok; burden=0 is a legitimate 'quiet day' signal."""
+    lk = await _resolve_lookups(db)
+    past = date.today() - timedelta(days=5)
+    db.add(SymptomLog(
+        id=uuid7(), user_id=user.id,
+        symptom_id=lk["symptoms"]["fatigue"].id,
+        intensity=4, status="resolved",
+        started_at=datetime(past.year, past.month, past.day, 9, tzinfo=UTC),
+        ended_at=datetime(past.year, past.month, past.day, 20, tzinfo=UTC),
+        recorded_at=datetime(past.year, past.month, past.day, 9, tzinfo=UTC),
+    ))
+    await db.flush()
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+
+    assert resp.block_availability.symptoms == "ok"
+    assert resp.current_symptom_burden == Decimal("0")
+    burden = await InsightService(db).symptom_burden(user.id)
+    assert burden.tracking_ever_used is True
+    assert burden.availability_status == "ok"
+
+
+# ── M-10. Healthy user — all physiological blocks ok ─────────────────────
+
+async def test_b4_summary_healthy_user_all_blocks_ok(
+    db: AsyncSession, user: User
+):
+    """When all three physiological metrics are fresh, have valid baselines,
+    and have data today, the summary aggregate must be ok — no false negative."""
+    # Seed 5 stable days ending today for each illness metric + HRV recovery.
+    for slug, unit in [
+        ("hrv_rmssd", "ms"), ("resting_hr", "bpm"), ("body_temperature", "°C")
+    ]:
+        await _seed_metric_with_baseline(
+            db, user, slug, unit,
+            baseline_values=[45.0, 45.1, 45.0, 45.0, 45.0],
+            today_value=45.0,
+        )
+
+    svc = InsightService(db)
+    resp = await svc.summary(user.id)
+
+    assert resp.block_availability.deviations == "ok"
+    assert resp.block_availability.illness == "ok"
+    assert resp.block_availability.recovery == "ok"
+    assert resp.data_availability is not None
+    assert resp.data_availability.availability_status == "ok"
+    assert resp.data_availability.has_data_for_target_date is True
+    assert resp.data_availability.missing_metrics == []
+    assert resp.data_availability.stale_metrics == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# N — B5: Backend Regression Hardening
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# N-1 to N-5  : _worst_availability pure unit tests (no DB)
+# N-6 to N-9  : Summary aggregation edge cases
+# N-10 to N-15: Endpoint contract tests
+# N-16 to N-20: Real-world scenario anchors
+
+# ── N-1 to N-5. _worst_availability unit tests ───────────────────────────
+
+
+def test_b5_worst_partial_plus_stale_returns_stale():
+    assert _worst_availability("partial", "stale_data") == "stale_data"
+
+
+def test_b5_worst_partial_plus_no_data_today_returns_no_data_today():
+    assert _worst_availability("partial", "no_data_today") == "no_data_today"
+
+
+def test_b5_worst_insufficient_plus_no_data_returns_no_data():
+    assert _worst_availability("insufficient_data", "no_data") == "no_data"
+
+
+def test_b5_worst_not_applicable_ignored_when_mixed_with_problems():
+    assert _worst_availability("not_applicable", "partial") == "partial"
+    assert _worst_availability("not_applicable", "stale_data") == "stale_data"
+    assert _worst_availability("not_applicable", "no_data") == "no_data"
+
+
+def test_b5_worst_all_not_applicable_returns_ok():
+    assert _worst_availability("not_applicable", "not_applicable") == "ok"
+
+
+# ── N-6. Empty DataAvailability lists on new user ─────────────────────────
+
+
+async def test_b5_summary_data_availability_empty_lists_new_user(
+    db: AsyncSession, user: User
+):
+    """A brand-new user's summary DataAvailability must have empty metric
+    lists (not None) — a valid but empty envelope."""
+    resp = await InsightService(db).summary(user.id)
+
+    da = resp.data_availability
+    assert da is not None
+    # illness + recovery required metrics show up as missing (no measurements)
+    assert set(da.missing_metrics) == {"body_temperature", "hrv_rmssd", "resting_hr"}
+    assert da.metrics_with_baseline == []
+    assert da.metrics_without_baseline == []
+    assert da.stale_metrics == []
+    assert da.latest_measured_at is None
+    # All three are missing → aggregate = no_data
+    assert da.availability_status == "no_data"
+    # Deduplication: lists must not contain repeats
+    assert len(da.missing_metrics) == len(set(da.missing_metrics))
+
+
+# ── N-7. latest_measured_at surfaces through when some blocks have data ───
+
+
+async def test_b5_summary_latest_measured_at_when_some_blocks_have_data(
+    db: AsyncSession, user: User
+):
+    """When HRV has data today but body_temperature is absent, the summary
+    latest_measured_at must reflect the HRV timestamp (not collapse to None
+    because one metric is missing)."""
+    await _seed_metric_with_baseline(
+        db, user, "hrv_rmssd", "ms",
+        baseline_values=[45.0, 45.1, 45.0, 45.0],
+        today_value=45.0,
+    )
+    resp = await InsightService(db).summary(user.id)
+    da = resp.data_availability
+    assert da is not None
+    assert da.latest_measured_at is not None
+    assert da.latest_measured_at.date() == date.today()
+    # illness = partial (body_temp missing), but timestamp still surfaces.
+    assert resp.block_availability.illness == "partial"
+
+
+# ── N-8. missing_metrics deduplicated across blocks ───────────────────────
+
+
+async def test_b5_summary_missing_metrics_deduplicated_across_blocks(
+    db: AsyncSession, user: User
+):
+    """hrv_rmssd is required by both illness and recovery blocks.
+    The summary's missing_metrics must contain it exactly once."""
+    # New user — no measurements at all.
+    resp = await InsightService(db).summary(user.id)
+    da = resp.data_availability
+    assert da is not None
+    assert da.missing_metrics.count("hrv_rmssd") <= 1
+    assert len(da.missing_metrics) == len(set(da.missing_metrics))
+    assert len(da.metrics_with_baseline) == len(set(da.metrics_with_baseline))
+    assert len(da.metrics_without_baseline) == len(set(da.metrics_without_baseline))
+    assert len(da.stale_metrics) == len(set(da.stale_metrics))
+
+
+# ── N-9. Multi-user isolation ─────────────────────────────────────────────
+
+
+async def test_b5_multi_user_states_do_not_bleed(db: AsyncSession):
+    """User A (full baseline) and user B (no data) must get independent
+    summaries — user A's measurements must not appear in user B's response."""
+    user_a = User(id=uuid7(), email="a_b5@test.local", name="User A B5")
+    user_b = User(id=uuid7(), email="b_b5@test.local", name="User B B5")
+    db.add_all([user_a, user_b])
+    await db.flush()
+
+    for slug, unit in [
+        ("hrv_rmssd", "ms"), ("resting_hr", "bpm"), ("body_temperature", "°C")
+    ]:
+        await _seed_metric_with_baseline(
+            db, user_a, slug, unit,
+            baseline_values=[45.0, 45.1, 45.0, 45.0],
+            today_value=45.0,
+        )
+
+    svc = InsightService(db)
+    summary_a = await svc.summary(user_a.id)
+    summary_b = await svc.summary(user_b.id)
+
+    assert summary_a.data_availability.availability_status == "ok"
+    assert summary_b.data_availability.availability_status != "ok"
+    assert summary_b.data_availability.latest_measured_at is None
+    assert summary_b.data_availability.metrics_with_baseline == []
+
+
+# ── N-10 to N-15. Endpoint contract tests ────────────────────────────────
+
+
+async def test_b5_contract_data_availability_present_in_deviations(
+    db: AsyncSession, user: User
+):
+    """physiological_deviations must always include a non-None
+    data_availability whose availability_status matches the top-level field."""
+    resp = await InsightService(db).physiological_deviations(user.id)
+    assert resp.data_availability is not None
+    assert resp.availability_status == resp.data_availability.availability_status
+
+
+async def test_b5_contract_data_availability_present_in_illness(
+    db: AsyncSession, user: User
+):
+    """illness_signal must always include data_availability with
+    availability_status consistent with the top-level field."""
+    resp = await InsightService(db).illness_signal(user.id)
+    assert resp.data_availability is not None
+    assert resp.availability_status == resp.data_availability.availability_status
+
+
+async def test_b5_contract_data_availability_present_in_recovery(
+    db: AsyncSession, user: User
+):
+    """recovery_status must always include data_availability with
+    availability_status consistent with current_availability_status."""
+    resp = await InsightService(db).recovery_status(user.id)
+    assert resp.data_availability is not None
+    assert resp.current_availability_status == resp.data_availability.availability_status
+
+
+async def test_b5_contract_signal_status_none_when_availability_not_ok(
+    db: AsyncSession, user: User
+):
+    """A new user (no data) must have signal_status = None in the illness
+    response — never a spurious health signal from absent data."""
+    resp = await InsightService(db).illness_signal(user.id)
+    assert resp.availability_status != "ok"
+    assert resp.signal_status is None
+
+
+async def test_b5_contract_block_availability_always_in_summary(
+    db: AsyncSession, user: User
+):
+    """summary must always include block_availability with all five named
+    fields populated — none may be absent or None."""
+    resp = await InsightService(db).summary(user.id)
+    ba = resp.block_availability
+    assert ba is not None
+    for field in ("deviations", "illness", "recovery", "adherence", "symptoms"):
+        assert getattr(ba, field) is not None, f"block_availability.{field} is None"
+
+
+async def test_b5_contract_overall_adherence_pct_accepts_none(
+    db: AsyncSession, user: User
+):
+    """overall_adherence_pct must be None (not 0.0 or a validation error)
+    when there are no active medication regimens."""
+    resp = await InsightService(db).medication_adherence(user.id)
+    assert resp.availability_status == "not_applicable"
+    assert resp.overall_adherence_pct is None
+    summary = await InsightService(db).summary(user.id)
+    assert summary.overall_adherence_pct is None
+
+
+# ── N-16 to N-20. Real-world scenario anchors ─────────────────────────────
+
+
+async def test_b5_real_garmin_only_no_body_temperature_illness_partial(
+    db: AsyncSession, user: User
+):
+    """User has Garmin (HRV + RHR) but has never measured body temperature
+    manually.  illness_signal availability must be 'partial' and
+    body_temperature must appear in missing_metrics."""
+    lk = await _resolve_lookups(db)
+    garmin = lk["sources"]["garmin"]
+    today = date.today()
+    for slug, unit in [("hrv_rmssd", "ms"), ("resting_hr", "bpm")]:
+        mt = lk["metrics"][slug]
+        for offset in range(5):
+            d = today - timedelta(days=4 - offset)
+            db.add(Measurement(
+                id=uuid7(), user_id=user.id,
+                metric_type_id=mt.id, source_id=garmin.id,
+                value_num=Decimal("45.0"), unit=unit,
+                measured_at=_dt(d, 6), recorded_at=_dt(d, 6),
+                aggregation_level="daily",
+            ))
+    await db.flush()
+
+    resp = await InsightService(db).illness_signal(user.id)
+    assert resp.availability_status == "partial"
+    assert resp.data_availability is not None
+    assert "body_temperature" in resp.data_availability.missing_metrics
+
+
+async def test_b5_real_garmin_synced_yesterday_no_data_today(
+    db: AsyncSession, user: User
+):
+    """Garmin sync landed yesterday but produced no HRV value for today yet.
+    recovery availability must be no_data_today and signal must be None."""
+    lk = await _resolve_lookups(db)
+    garmin = lk["sources"]["garmin"]
+    hrv_mt = lk["metrics"]["hrv_rmssd"]
+    today = date.today()
+    # Four HRV measurements ending YESTERDAY (today has no row).
+    for offset in range(4):
+        d = today - timedelta(days=4 - offset)  # today-4 … today-1
+        db.add(Measurement(
+            id=uuid7(), user_id=user.id,
+            metric_type_id=hrv_mt.id, source_id=garmin.id,
+            value_num=Decimal("45.0"), unit="ms",
+            measured_at=_dt(d, 6), recorded_at=_dt(d, 6),
+            aggregation_level="daily",
+        ))
+    await db.flush()
+
+    resp = await InsightService(db).recovery_status(user.id)
+    assert resp.current_availability_status == "no_data_today"
+    assert resp.data_availability.has_data_for_target_date is False
+    assert resp.current_signal_status is None
+
+
+async def test_b5_real_hc900_weight_stale_beyond_seven_day_budget(
+    db: AsyncSession, user: User
+):
+    """HC900 weight last recorded 10 days ago — beyond the 7-day budget.
+    assess_availability must flag it as stale_data."""
+    from app.services.insight_availability import assess_availability as _assess
+
+    lk = await _resolve_lookups(db)
+    manual = lk["sources"]["manual"]
+    weight_mt = lk["metrics"]["weight"]
+    today = date.today()
+    # Four weight measurements ending 10 days ago (10 > 7-day budget).
+    for offset in range(4):
+        d = today - timedelta(days=13 - offset)  # today-13 … today-10
+        db.add(Measurement(
+            id=uuid7(), user_id=user.id,
+            metric_type_id=weight_mt.id, source_id=manual.id,
+            value_num=Decimal("81.5"), unit="kg",
+            measured_at=_dt(d, 7), recorded_at=_dt(d, 7),
+            aggregation_level="spot",
+        ))
+    await db.flush()
+
+    avail = await _assess(db, user.id, required_metrics=["weight"], target_date=today)
+    assert avail.availability_status == "stale_data"
+    assert "weight" in avail.stale_metrics
+
+
+async def test_b5_real_freshly_formed_baseline_ok_at_minimum_points(
+    db: AsyncSession, user: User
+):
+    """User just started tracking HRV — exactly 3 preceding measurements
+    (baseline_points = 3, the minimum).  availability must be 'ok',
+    not 'insufficient_data'."""
+    # _seed_metric_with_baseline with 3 baseline_values seeds:
+    #   today-3, today-2, today-1 (preceding) + today → 4 total rows,
+    #   baseline window for today = 3 points (exactly the minimum).
+    await _seed_metric_with_baseline(
+        db, user, "hrv_rmssd", "ms",
+        baseline_values=[45.0, 45.1, 45.0],
+        today_value=45.0,
+    )
+    resp = await InsightService(db).recovery_status(user.id)
+    assert resp.current_availability_status == "ok"
+    assert resp.current_signal_status is not None
+
+
+async def test_b5_real_medication_partial_when_pending_first_log(
+    db: AsyncSession, user: User
+):
+    """Active regimen with zero logs must yield availability_status='partial'
+    (Opção B) — 'ok' would mislead: the feature is not yet producing data."""
+    med_def = MedicationDefinition(name="Omega-3", dosage_form="softgel")
+    db.add(med_def)
+    await db.flush()
+    db.add(MedicationRegimen(
+        id=uuid7(), user_id=user.id, medication_id=med_def.id,
+        dosage_amount=Decimal("1"), dosage_unit="softgel",
+        frequency="daily", started_at=date.today(),
+    ))
+    await db.flush()
+
+    resp = await InsightService(db).medication_adherence(user.id)
+    assert resp.availability_status == "partial"
+    assert len(resp.items) == 1
+    assert resp.items[0].item_status == "pending_first_log"
+    assert resp.overall_adherence_pct is None

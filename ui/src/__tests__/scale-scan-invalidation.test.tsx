@@ -41,6 +41,7 @@ vi.mock('../api/client', async () => {
     fetchMeasurements: vi.fn(),
     fetchCheckpoints: vi.fn(),
     fetchLatestScaleReading: vi.fn(),
+    fetchSystemStatus: vi.fn(),
     scanScale: vi.fn(),
   };
 });
@@ -80,6 +81,14 @@ const defaultSummary = {
   current_symptom_burden: '0' as unknown as number,
   illness_signal: 'low',
   recovery_status: 'recovered',
+  block_availability: {
+    deviations: 'ok' as const,
+    illness: 'ok' as const,
+    recovery: 'ok' as const,
+    adherence: 'ok' as const,
+    symptoms: 'ok' as const,
+  },
+  data_availability: null,
 };
 
 function renderWithQC() {
@@ -101,14 +110,23 @@ describe('Scan → scale-latest invalidation → auto-refresh', () => {
       deviation_threshold: 2.0 as unknown as number,
       deviations: [],
       metrics_flagged: 0,
+      availability_status: 'ok' as const,
+      data_availability: null,
     });
     vi.mocked(client.fetchMedicationAdherence).mockResolvedValue({
       user_id: 'test-user-id',
       items: [],
-      overall_adherence_pct: 0,
+      overall_adherence_pct: null,
+      availability_status: 'not_applicable' as const,
     });
     vi.mocked(client.fetchMeasurements).mockResolvedValue({ ...emptyList, total: 10 });
     vi.mocked(client.fetchCheckpoints).mockResolvedValue({ items: [], total: 0, offset: 0, limit: 14 });
+    vi.mocked(client.fetchSystemStatus).mockResolvedValue({
+      user_id: 'test-user-id',
+      sources: [],
+      agents: [],
+      as_of: new Date().toISOString(),
+    });
     vi.mocked(client.scanScale).mockResolvedValue({ status: 'ok', message: 'Import complete' });
   });
 

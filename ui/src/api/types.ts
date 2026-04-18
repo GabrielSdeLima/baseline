@@ -1,11 +1,47 @@
+// ── Onda 2 availability types ─────────────────────────────────────────────
+
+export type AvailabilityStatus =
+  | 'ok'
+  | 'no_data'
+  | 'no_data_today'
+  | 'insufficient_data'
+  | 'stale_data'
+  | 'partial'
+  | 'not_applicable';
+
+export interface DataAvailability {
+  availability_status: AvailabilityStatus;
+  target_date: string | null;
+  has_data_for_target_date: boolean | null;
+  latest_measured_at: string | null;
+  latest_synced_at: string | null;
+  missing_metrics: string[];
+  metrics_with_baseline: string[];
+  metrics_without_baseline: string[];
+  stale_metrics: string[];
+}
+
+export interface SummaryBlockAvailability {
+  deviations: AvailabilityStatus;
+  illness: AvailabilityStatus;
+  recovery: AvailabilityStatus;
+  adherence: AvailabilityStatus;
+  symptoms: AvailabilityStatus;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export interface InsightSummary {
   user_id: string;
   as_of: string;
-  overall_adherence_pct: number;
+  /** null when no active regimens (not_applicable) or all pending. */
+  overall_adherence_pct: number | null;
   active_deviations: number;
   current_symptom_burden: number;
   illness_signal: string;
   recovery_status: string;
+  block_availability: SummaryBlockAvailability;
+  data_availability: DataAvailability | null;
 }
 
 export interface MetricDeviation {
@@ -26,6 +62,8 @@ export interface PhysiologicalDeviationsResponse {
   deviation_threshold: number;
   deviations: MetricDeviation[];
   metrics_flagged: number;
+  availability_status: AvailabilityStatus;
+  data_availability: DataAvailability | null;
 }
 
 export interface IllnessSignalDay {
@@ -69,13 +107,17 @@ export interface MedicationAdherenceItem {
   skipped: number;
   delayed: number;
   total: number;
-  adherence_pct: number;
+  /** null when item_status is pending_first_log. */
+  adherence_pct: number | null;
+  item_status: 'ok' | 'pending_first_log';
 }
 
 export interface MedicationAdherenceResponse {
   user_id: string;
   items: MedicationAdherenceItem[];
-  overall_adherence_pct: number;
+  /** null when not_applicable or all items are pending_first_log. */
+  overall_adherence_pct: number | null;
+  availability_status: AvailabilityStatus;
 }
 
 export interface MedicationDefinitionResponse {
@@ -166,6 +208,36 @@ export interface MedicationRegimenList {
   offset: number;
   limit: number;
 }
+
+// ── Onda 3 B1 System Status ───────────────────────────────────────────────
+
+export type AgentStatus = 'active' | 'stale' | 'unknown';
+
+export interface SystemSourceStatus {
+  source_slug: string;
+  integration_configured: boolean;
+  device_paired: boolean | null;
+  last_sync_at: string | null;
+  last_advanced_at: string | null;
+  last_run_status: string | null;
+  last_run_at: string | null;
+}
+
+export interface SystemAgentSummary {
+  agent_type: string;
+  display_name: string | null;
+  status: AgentStatus;
+  last_seen_at: string | null;
+}
+
+export interface SystemStatusResponse {
+  user_id: string;
+  sources: SystemSourceStatus[];
+  agents: SystemAgentSummary[];
+  as_of: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 export type ScaleReadingStatus = 'full_reading' | 'weight_only' | 'never_measured';
 

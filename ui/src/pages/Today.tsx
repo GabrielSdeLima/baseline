@@ -13,6 +13,7 @@ import InsightCard from '../components/InsightCard';
 import SignalBadge from '../components/SignalBadge';
 import FreshnessBar from '../components/FreshnessBar';
 import ScaleReadingCard from '../components/ScaleReadingCard';
+import { availabilityLabel } from '../lib/availabilityLabel';
 
 type TrendDir = '↑' | '↓' | '→';
 
@@ -33,7 +34,6 @@ function computeHrvTrend(items: Array<{ measured_at: string; value_num: number }
   const pct = (latest - prevAvg) / prevAvg;
   const dir: TrendDir = pct > 0.03 ? '↑' : pct < -0.03 ? '↓' : '→';
 
-  // Count consecutive days at same direction (each consecutive pair)
   let streak = 1;
   for (let i = sorted.length - 2; i >= 1; i--) {
     const d = sorted[i] - sorted[i - 1];
@@ -101,9 +101,6 @@ export default function Today() {
 
   const summary = summaryQ.data;
 
-  const baselineForming =
-    !hrvCountQ.isLoading && (hrvCountQ.data?.total ?? 0) < 3;
-
   const hrvTrend = hrvCountQ.data?.items.length
     ? computeHrvTrend(hrvCountQ.data.items)
     : null;
@@ -126,9 +123,6 @@ export default function Today() {
     return `${d.metric_name}  z=${z}  (${sign}${Math.round(Number(d.delta_abs))}${unitStr})`;
   };
 
-  const noRegimens =
-    !adherenceQ.isLoading && (adherenceQ.data?.items.length ?? 0) === 0;
-
   return (
     <div className="space-y-3">
       <FreshnessBar userId={userId} />
@@ -142,21 +136,26 @@ export default function Today() {
         error={summaryQ.error as Error | null}
       >
         {summary && (
-          <div>
-            <SignalBadge signal={summary.illness_signal} />
-            {summary.illness_signal === 'insufficient_data' ? (
-              <p className="text-xs text-gray-400 mt-1">
-                establishing baseline · fewer than 3 data points
-              </p>
-            ) : hrvTrend && (
-              <p className="text-xs text-gray-400 mt-1 font-mono">
-                HRV {hrvTrend.dir} {hrvTrend.streakDays}d
-                {hrvTrend.latestMs != null && (
-                  <span className="ml-1">· {Math.round(hrvTrend.latestMs)} ms</span>
-                )}
-              </p>
-            )}
-          </div>
+          summary.block_availability.illness === 'ok' || summary.block_availability.illness === 'partial' ? (
+            <div>
+              <SignalBadge signal={summary.illness_signal} />
+              {summary.block_availability.illness === 'partial' && (
+                <p className="text-xs text-amber-500 mt-1">partial coverage</p>
+              )}
+              {summary.block_availability.illness === 'ok' && hrvTrend && (
+                <p className="text-xs text-gray-400 mt-1 font-mono">
+                  HRV {hrvTrend.dir} {hrvTrend.streakDays}d
+                  {hrvTrend.latestMs != null && (
+                    <span className="ml-1">· {Math.round(hrvTrend.latestMs)} ms</span>
+                  )}
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="text-sm text-gray-500">
+              {availabilityLabel(summary.block_availability.illness)}
+            </p>
+          )
         )}
       </InsightCard>
 
@@ -169,21 +168,26 @@ export default function Today() {
         error={summaryQ.error as Error | null}
       >
         {summary && (
-          <div>
-            <SignalBadge signal={summary.recovery_status} />
-            {summary.recovery_status === 'insufficient_data' ? (
-              <p className="text-xs text-gray-400 mt-1">
-                establishing baseline · fewer than 3 data points
-              </p>
-            ) : hrvTrend && (
-              <p className="text-xs text-gray-400 mt-1 font-mono">
-                HRV {hrvTrend.dir} {hrvTrend.streakDays}d
-                {hrvTrend.latestMs != null && (
-                  <span className="ml-1">· {Math.round(hrvTrend.latestMs)} ms</span>
-                )}
-              </p>
-            )}
-          </div>
+          summary.block_availability.recovery === 'ok' || summary.block_availability.recovery === 'partial' ? (
+            <div>
+              <SignalBadge signal={summary.recovery_status} />
+              {summary.block_availability.recovery === 'partial' && (
+                <p className="text-xs text-amber-500 mt-1">partial coverage</p>
+              )}
+              {summary.block_availability.recovery === 'ok' && hrvTrend && (
+                <p className="text-xs text-gray-400 mt-1 font-mono">
+                  HRV {hrvTrend.dir} {hrvTrend.streakDays}d
+                  {hrvTrend.latestMs != null && (
+                    <span className="ml-1">· {Math.round(hrvTrend.latestMs)} ms</span>
+                  )}
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="text-sm text-gray-500">
+              {availabilityLabel(summary.block_availability.recovery)}
+            </p>
+          )
         )}
       </InsightCard>
 
@@ -196,12 +200,14 @@ export default function Today() {
       >
         {summary && (
           <div>
-            {baselineForming ? (
+            {summary.block_availability.deviations !== 'ok' ? (
               <p className="text-sm text-gray-500">
-                Baseline forming
-                <span className="block text-xs text-gray-400 mt-0.5">
-                  {hrvCountQ.data?.total ?? 0} of 3 HRV readings collected
-                </span>
+                {availabilityLabel(summary.block_availability.deviations)}
+                {summary.block_availability.deviations === 'insufficient_data' && (
+                  <span className="block text-xs text-gray-400 mt-0.5">
+                    {hrvCountQ.data?.total ?? 0} of 3 HRV readings collected
+                  </span>
+                )}
               </p>
             ) : (
               <>
@@ -240,11 +246,15 @@ export default function Today() {
       >
         {summary && (
           <div>
-            <p className="text-sm text-gray-900">
-              {Number(summary.current_symptom_burden) === 0
-                ? 'No symptoms today'
-                : `Burden: ${Number(summary.current_symptom_burden).toFixed(1)}`}
-            </p>
+            {summary.block_availability.symptoms === 'not_applicable' ? (
+              <p className="text-sm text-gray-400">Symptom tracking not started</p>
+            ) : (
+              <p className="text-sm text-gray-900">
+                {Number(summary.current_symptom_burden) === 0
+                  ? 'No symptoms today'
+                  : `Burden: ${Number(summary.current_symptom_burden).toFixed(1)}`}
+              </p>
+            )}
           </div>
         )}
       </InsightCard>
@@ -264,11 +274,13 @@ export default function Today() {
         error={adherenceQ.error as Error | null}
       >
         <div>
-          {noRegimens ? (
+          {adherenceQ.data?.availability_status === 'not_applicable' ? (
             <p className="text-sm text-gray-400">No active regimens</p>
+          ) : adherenceQ.data?.overall_adherence_pct == null ? (
+            <p className="text-sm text-gray-400">Regimen active, waiting for first log</p>
           ) : (
             <p className="text-sm text-gray-900">
-              {Number(adherenceQ.data?.overall_adherence_pct ?? 0).toFixed(0)}% overall
+              {Number(adherenceQ.data.overall_adherence_pct).toFixed(0)}% overall
             </p>
           )}
         </div>

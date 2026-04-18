@@ -6,6 +6,7 @@ from app.api.v1.integrations import router as integrations_router
 from app.api.v1.measurements import router as measurements_router
 from app.api.v1.medications import router as medications_router
 from app.api.v1.raw_payloads import router as raw_payloads_router
+from app.api.v1.status import router as status_router
 from app.api.v1.symptoms import router as symptoms_router
 from app.api.v1.workouts import router as workouts_router
 
@@ -19,3 +20,4 @@ api_router.include_router(symptoms_router)
 api_router.include_router(checkpoints_router)
 api_router.include_router(insights_router)
 api_router.include_router(integrations_router)
+api_router.include_router(status_router)

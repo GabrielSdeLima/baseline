@@ -18,6 +18,7 @@ class InsightRepository:
     # ── Medication Adherence ──────────────────────────────────────────
 
     async def get_medication_adherence(self, user_id: uuid.UUID):
+        """Legacy: read from view (INNER JOIN — only regimens with logs)."""
         result = await self.session.execute(
             text("""
                 SELECT medication_name, frequency,
@@ -29,6 +30,54 @@ class InsightRepository:
             {"uid": user_id},
         )
         return result.fetchall()
+
+    async def get_active_medication_regimens(self, user_id: uuid.UUID):
+        """B3: LEFT JOIN ensures regimens without logs are included.
+
+        Rows with total=0 signal ``pending_first_log``; adherence_pct is
+        NULL for those rows so the service can distinguish them from
+        legitimate 0% adherence.
+        """
+        result = await self.session.execute(
+            text("""
+                SELECT
+                    mr.id          AS regimen_id,
+                    md.name        AS medication_name,
+                    mr.frequency,
+                    COALESCE(COUNT(ml.id), 0)                          AS total,
+                    COALESCE(COUNT(ml.id) FILTER (WHERE ml.status = 'taken'),   0) AS taken,
+                    COALESCE(COUNT(ml.id) FILTER (WHERE ml.status = 'skipped'), 0) AS skipped,
+                    COALESCE(COUNT(ml.id) FILTER (WHERE ml.status = 'delayed'), 0) AS delayed,
+                    CASE
+                        WHEN COUNT(ml.id) = 0 THEN NULL
+                        ELSE ROUND(
+                            100.0
+                            * COUNT(ml.id) FILTER (WHERE ml.status = 'taken')
+                            / NULLIF(COUNT(ml.id), 0),
+                        1)
+                    END AS adherence_pct
+                FROM medication_regimens mr
+                JOIN medication_definitions md ON mr.medication_id = md.id
+                LEFT JOIN medication_logs ml ON ml.regimen_id = mr.id
+                WHERE mr.user_id = :uid AND mr.is_active = true
+                GROUP BY mr.id, md.name, mr.frequency
+                ORDER BY md.name
+            """),
+            {"uid": user_id},
+        )
+        return result.fetchall()
+
+    async def has_any_symptom_logs(self, user_id: uuid.UUID) -> bool:
+        """Return True if the user has ever logged any symptom."""
+        row = await self.session.execute(
+            text("""
+                SELECT EXISTS(
+                    SELECT 1 FROM symptom_logs WHERE user_id = :uid
+                )
+            """),
+            {"uid": user_id},
+        )
+        return bool(row.scalar_one())
 
     # ── Metric Baseline (for deviations, illness signal, recovery) ───
 
