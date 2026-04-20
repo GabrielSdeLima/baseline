@@ -4,6 +4,7 @@ import type {
   IllnessSignalResponse,
   RecoveryStatusResponse,
   MedicationAdherenceResponse,
+  MedicationLogList,
   MeasurementList,
   DailyCheckpointList,
   SymptomLogList,
@@ -11,6 +12,7 @@ import type {
   MedicationDefinitionResponse,
   LatestScaleReading,
   SystemStatusResponse,
+  GarminSyncResponse,
 } from './types';
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
@@ -79,6 +81,11 @@ export const fetchRecoveryStatus = (userId: string, start: string, end: string) 
 export const fetchMedicationAdherence = (userId: string) =>
   apiFetch<MedicationAdherenceResponse>(
     `/insights/medication-adherence${qs({ user_id: userId })}`
+  );
+
+export const fetchMedicationLogs = (userId: string, date: string) =>
+  apiFetch<MedicationLogList>(
+    `/medications/logs${qs({ user_id: userId, start_date: date, end_date: date, limit: 50 })}`
   );
 
 // Data
@@ -162,6 +169,12 @@ export const scanScale = (
     `/integrations/scale/scan${qs({ user_id: userId, ...profile, mac })}`,
     { method: 'POST', signal }
   );
+
+export const syncGarmin = (userId: string) =>
+  apiFetch<GarminSyncResponse>('/integrations/garmin/sync', {
+    method: 'POST',
+    body: JSON.stringify({ user_id: userId }),
+  });
 
 export interface DiscoveredScale {
   mac: string;

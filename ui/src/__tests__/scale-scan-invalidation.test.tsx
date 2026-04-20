@@ -1,20 +1,29 @@
 /**
  * Closes the loop on the user-facing requirement:
  *   "scale-latest invalidates correctly after Scan"
- *   "Home reflects the new reading without manual refresh"
+ *   "Today reflects the new reading without manual refresh"
  *
- * The test mounts Today, waits for the initial `never_measured` state to
- * render, triggers the Scan button in FreshnessBar, and then flips the
- * mock to return a full_reading.  If invalidation fires correctly,
- * react-query refetches and the card updates in-place — no reload.
+ * In Today v2 the scale scan is triggered from the "Weigh in" action in the
+ * priority list. After the scan succeeds the today-v2 queries are invalidated;
+ * react-query refetches and the weight completion flips from missing → complete.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import Today from '../pages/Today';
 import * as client from '../api/client';
-import type { LatestScaleReading } from '../api/types';
+import type {
+  DailyCheckpointList,
+  LatestScaleReading,
+  MeasurementList,
+  MedicationAdherenceResponse,
+  MedicationRegimenList,
+  SymptomLogList,
+  SystemStatusResponse,
+} from '../api/types';
+
+const DATE = '2026-04-17';
+const NOW = '2026-04-17T18:00:00.000Z';
 
 vi.mock('../config', () => ({
   getUserId: () => 'test-user-id',
@@ -35,12 +44,14 @@ vi.mock('../api/client', async () => {
   const actual = await vi.importActual<typeof import('../api/client')>('../api/client');
   return {
     ...actual,
-    fetchSummary: vi.fn(),
-    fetchDeviations: vi.fn(),
+    todayISO: () => DATE,
+    nowISO: () => NOW,
     fetchMedicationAdherence: vi.fn(),
     fetchMeasurements: vi.fn(),
     fetchCheckpoints: vi.fn(),
+    fetchSymptomLogs: vi.fn(),
     fetchLatestScaleReading: vi.fn(),
+    fetchActiveRegimens: vi.fn(),
     fetchSystemStatus: vi.fn(),
     scanScale: vi.fn(),
   };
@@ -57,103 +68,123 @@ const NEVER: LatestScaleReading = {
 
 const FULL: LatestScaleReading = {
   status: 'full_reading',
-  measured_at: new Date(Date.now() - 60_000).toISOString(),
+  measured_at: `${DATE}T17:30:00.000Z`,
   raw_payload_id: '019d9908-aaaa-7777-8888-999999999999',
   decoder_version: 'hc900_ble_v2',
   has_impedance: true,
   metrics: {
     weight: { slug: 'weight', value: '78.12', unit: 'kg', is_derived: false },
-    impedance_adc: { slug: 'impedance_adc', value: '530', unit: 'adc', is_derived: false },
-    bmi: { slug: 'bmi', value: '24.1', unit: 'kg/m²', is_derived: true },
-    bmr: { slug: 'bmr', value: '1725', unit: 'kcal', is_derived: true },
-    body_fat_pct: { slug: 'body_fat_pct', value: '22.0', unit: '%', is_derived: true },
-    muscle_pct: { slug: 'muscle_pct', value: '50.0', unit: '%', is_derived: true },
-    water_pct: { slug: 'water_pct', value: '56.5', unit: '%', is_derived: true },
   },
 };
 
-const emptyList = { items: [], total: 0, offset: 0, limit: 1 };
-const defaultSummary = {
+const emptyMeasurements: MeasurementList = { items: [], total: 0, offset: 0, limit: 1 };
+const emptyCheckpoints: DailyCheckpointList = { items: [], total: 0, offset: 0, limit: 14 };
+const emptySymptoms: SymptomLogList = { items: [], total: 0, offset: 0, limit: 50 };
+const emptyRegimens: MedicationRegimenList = { items: [], total: 0, offset: 0, limit: 1 };
+const emptyAdherence: MedicationAdherenceResponse = {
   user_id: 'test-user-id',
-  as_of: '2026-04-16',
-  overall_adherence_pct: 80 as unknown as number,
-  active_deviations: 0,
-  current_symptom_burden: '0' as unknown as number,
-  illness_signal: 'low',
-  recovery_status: 'recovered',
-  block_availability: {
-    deviations: 'ok' as const,
-    illness: 'ok' as const,
-    recovery: 'ok' as const,
-    adherence: 'ok' as const,
-    symptoms: 'ok' as const,
-  },
-  data_availability: null,
+  items: [],
+  overall_adherence_pct: null,
+  availability_status: 'not_applicable',
+};
+const defaultSystemStatus: SystemStatusResponse = {
+  user_id: 'test-user-id',
+  sources: [
+    {
+      source_slug: 'garmin_connect',
+      integration_configured: true,
+      device_paired: null,
+      last_sync_at: NOW,
+      last_advanced_at: NOW,
+      last_run_status: 'ok',
+      last_run_at: NOW,
+    },
+    {
+      source_slug: 'hc900_ble',
+      integration_configured: true,
+      device_paired: true,
+      last_sync_at: NOW,
+      last_advanced_at: NOW,
+      last_run_status: 'ok',
+      last_run_at: NOW,
+    },
+  ],
+  agents: [],
+  as_of: NOW,
+};
+
+const weightAfter: MeasurementList = {
+  items: [
+    {
+      id: 'm-weight-after-scan',
+      user_id: 'test-user-id',
+      metric_type_slug: 'weight',
+      metric_type_name: 'Weight',
+      source_slug: 'hc900_ble',
+      value_num: 78.12,
+      unit: 'kg',
+      measured_at: `${DATE}T17:30:00.000Z`,
+      aggregation_level: 'raw',
+    },
+  ],
+  total: 1,
+  offset: 0,
+  limit: 5,
 };
 
 function renderWithQC() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
-      <Today />
-    </QueryClientProvider>
+      <Today onOpenInput={vi.fn()} />
+    </QueryClientProvider>,
   );
   return qc;
 }
 
-describe('Scan → scale-latest invalidation → auto-refresh', () => {
+describe('Scan → today-v2 invalidation → auto-refresh', () => {
   beforeEach(() => {
-    vi.mocked(client.fetchSummary).mockResolvedValue(defaultSummary);
-    vi.mocked(client.fetchDeviations).mockResolvedValue({
-      user_id: 'test-user-id',
-      baseline_window_days: 14,
-      deviation_threshold: 2.0 as unknown as number,
-      deviations: [],
-      metrics_flagged: 0,
-      availability_status: 'ok' as const,
-      data_availability: null,
-    });
-    vi.mocked(client.fetchMedicationAdherence).mockResolvedValue({
-      user_id: 'test-user-id',
-      items: [],
-      overall_adherence_pct: null,
-      availability_status: 'not_applicable' as const,
-    });
-    vi.mocked(client.fetchMeasurements).mockResolvedValue({ ...emptyList, total: 10 });
-    vi.mocked(client.fetchCheckpoints).mockResolvedValue({ items: [], total: 0, offset: 0, limit: 14 });
-    vi.mocked(client.fetchSystemStatus).mockResolvedValue({
-      user_id: 'test-user-id',
-      sources: [],
-      agents: [],
-      as_of: new Date().toISOString(),
-    });
+    vi.mocked(client.fetchMedicationAdherence).mockResolvedValue(emptyAdherence);
+    vi.mocked(client.fetchMeasurements).mockResolvedValue(emptyMeasurements);
+    vi.mocked(client.fetchCheckpoints).mockResolvedValue(emptyCheckpoints);
+    vi.mocked(client.fetchSymptomLogs).mockResolvedValue(emptySymptoms);
+    vi.mocked(client.fetchLatestScaleReading).mockResolvedValue(NEVER);
+    vi.mocked(client.fetchActiveRegimens).mockResolvedValue(emptyRegimens);
+    vi.mocked(client.fetchSystemStatus).mockResolvedValue(defaultSystemStatus);
     vi.mocked(client.scanScale).mockResolvedValue({ status: 'ok', message: 'Import complete' });
   });
 
   afterEach(() => vi.clearAllMocks());
 
-  it('card updates from never_measured → full_reading after Scan, no reload', async () => {
-    // Initially no readings
-    vi.mocked(client.fetchLatestScaleReading).mockResolvedValue(NEVER);
+  it('weight completion flips from missing → complete after Weigh in action', async () => {
     renderWithQC();
 
-    await waitFor(() =>
-      expect(screen.getByText(/No readings yet/i)).toBeInTheDocument()
-    );
+    // Before scan: weight completion is missing
+    await waitFor(() => expect(screen.getByTestId('today-completion')).toBeInTheDocument());
+    const completion = screen.getByTestId('today-completion');
+    expect(completion.textContent).toMatch(/weight\s*pending/i);
 
-    // After a successful scan, the server has a new full_reading
+    // After scan, the backend has a weight measurement today
+    vi.mocked(client.fetchMeasurements).mockImplementation((_u, slug) => {
+      if (slug === 'weight') return Promise.resolve(weightAfter);
+      return Promise.resolve(emptyMeasurements);
+    });
     vi.mocked(client.fetchLatestScaleReading).mockResolvedValue(FULL);
 
-    // Click the Scan button in FreshnessBar
-    const scanBtn = screen.getByRole('button', { name: /scan/i });
-    await userEvent.click(scanBtn);
+    // Click Weigh in — surfaces from the priority list.
+    const weighLabel = screen.getByText(/^Weigh in$/);
+    const weighItem = weighLabel.closest('li');
+    expect(weighItem).not.toBeNull();
+    const doBtn = weighItem!.querySelector('button');
+    expect(doBtn).not.toBeNull();
+    fireEvent.click(doBtn!);
 
-    // Mutation succeeds → invalidation fires → card refetches → new data renders
-    await waitFor(() =>
-      expect(screen.getByText('78.12')).toBeInTheDocument()
-    );
-    expect(screen.getByText('Body fat')).toBeInTheDocument();
-    expect(screen.getByText('22.0')).toBeInTheDocument();
-    expect(screen.queryByText(/No readings yet/i)).not.toBeInTheDocument();
+    await waitFor(() => expect(vi.mocked(client.scanScale)).toHaveBeenCalledTimes(1));
+
+    // Invalidation refetches today-v2.measurements.weight → weight becomes complete.
+    await waitFor(() => {
+      const node = screen.getByTestId('today-completion');
+      expect(node.textContent).toMatch(/weight\s*done/i);
+    });
   });
 });

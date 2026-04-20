@@ -1,20 +1,47 @@
-import { useState } from 'react';
+/**
+ * CaptureSurface — the primary daily-logging surface.
+ *
+ * Replaces the old QuickInputModal.  Key differences:
+ *   · Full-screen overlay — not a small centered modal.
+ *   · Five explicit sections: Check-in, Temperature, Symptoms, Medication,
+ *     Scale.  Opening from a Today action pre-selects the right section so
+ *     the user lands exactly where they need to be.
+ *   · Stays open after a successful save: shows "✓ Saved" for 1.5 s then
+ *     resets the form so the user can log another item in the same session.
+ *   · ESC dismisses.
+ */
+import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   createCheckpoint,
-  createSymptomLog,
-  createMedicationLog,
   createMeasurement,
+  createMedicationLog,
+  createSymptomLog,
   fetchActiveRegimens,
-  nowISO,
   localToISO,
+  nowISO,
+  scanScale,
   toDatetimeLocal,
   todayISO,
 } from '../api/client';
 import { getUserId } from '../config';
+import { loadScaleDevice } from '../lib/scaleDevice';
+import { loadScaleProfile } from '../lib/scaleProfile';
 
-export type QuickInputTab = 'checkpoint' | 'symptom' | 'medlog' | 'measurement';
-type Tab = QuickInputTab;
+export type CaptureSection =
+  | 'checkpoint'
+  | 'measurement'
+  | 'symptom'
+  | 'medlog'
+  | 'scale';
+
+const SECTIONS: { id: CaptureSection; label: string }[] = [
+  { id: 'checkpoint', label: 'Check-in' },
+  { id: 'measurement', label: 'Temperature' },
+  { id: 'symptom', label: 'Symptoms' },
+  { id: 'medlog', label: 'Medication' },
+  { id: 'scale', label: 'Scale' },
+];
 
 const SYMPTOM_SLUGS = [
   { slug: 'headache', label: 'Headache' },
@@ -25,11 +52,27 @@ const SYMPTOM_SLUGS = [
   { slug: 'insomnia', label: 'Insomnia' },
 ];
 
-const MANUAL_METRICS = [
-  { slug: 'body_temperature', label: 'Body Temperature', unit: '°C', step: '0.1', min: '34', max: '42' },
-];
+const TEMPERATURE_METRIC = {
+  slug: 'body_temperature',
+  unit: '°C',
+  step: '0.1',
+  min: '34',
+  max: '42',
+};
 
-function ScoreRow({ value, onChange, label }: { value: number | null; onChange: (v: number) => void; label: string }) {
+const SCAN_TIMEOUT_S = 45;
+
+// ── Shared primitives ─────────────────────────────────────────────────────
+
+function ScoreRow({
+  value,
+  onChange,
+  label,
+}: {
+  value: number | null;
+  onChange: (v: number) => void;
+  label: string;
+}) {
   return (
     <div>
       <label className="block text-xs text-gray-500 mb-1">{label}</label>
@@ -53,12 +96,16 @@ function ScoreRow({ value, onChange, label }: { value: number | null; onChange: 
   );
 }
 
+// ── Section forms ─────────────────────────────────────────────────────────
+
 function CheckpointForm({ onSuccess }: { onSuccess: () => void }) {
   const now = new Date();
   const userId = getUserId();
   const qc = useQueryClient();
 
-  const [type, setType] = useState<'morning' | 'night'>(now.getHours() < 14 ? 'morning' : 'night');
+  const [type, setType] = useState<'morning' | 'night'>(
+    now.getHours() < 14 ? 'morning' : 'night',
+  );
   const [date, setDate] = useState(todayISO());
   const [energy, setEnergy] = useState<number | null>(null);
   const [mood, setMood] = useState<number | null>(null);
@@ -68,7 +115,9 @@ function CheckpointForm({ onSuccess }: { onSuccess: () => void }) {
 
   const mut = useMutation({
     mutationFn: () => {
-      const at = new Date(`${date}T${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`).toISOString();
+      const at = new Date(
+        `${date}T${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`,
+      ).toISOString();
       return createCheckpoint({
         user_id: userId,
         checkpoint_type: type,
@@ -84,14 +133,22 @@ function CheckpointForm({ onSuccess }: { onSuccess: () => void }) {
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['checkpoints'] });
-      qc.invalidateQueries({ queryKey: ['summary', userId] });
+      qc.invalidateQueries({ queryKey: ['today-v2'] });
       onSuccess();
     },
     onError: (e: Error) => setError(e.message),
   });
 
   return (
-    <form onSubmit={(e) => { e.preventDefault(); setError(''); mut.mutate(); }} className="space-y-4">
+    <form
+      data-testid="capture-checkpoint-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        setError('');
+        mut.mutate();
+      }}
+      className="space-y-4"
+    >
       <div className="flex gap-2">
         {(['morning', 'night'] as const).map((t) => (
           <button
@@ -117,7 +174,6 @@ function CheckpointForm({ onSuccess }: { onSuccess: () => void }) {
         />
       </div>
 
-      {/* Morning: sleep quality first, then energy + mood */}
       {type === 'morning' && (
         <>
           <ScoreRow value={sleepQ} onChange={setSleepQ} label="Sleep quality" />
@@ -126,7 +182,6 @@ function CheckpointForm({ onSuccess }: { onSuccess: () => void }) {
         </>
       )}
 
-      {/* Night: energy + mood only (no sleep quality) */}
       {type === 'night' && (
         <>
           <ScoreRow value={energy} onChange={setEnergy} label="Energy" />
@@ -151,7 +206,92 @@ function CheckpointForm({ onSuccess }: { onSuccess: () => void }) {
         disabled={mut.isPending}
         className="w-full bg-gray-900 text-white text-sm py-2 rounded hover:bg-gray-700 disabled:opacity-50 transition-colors"
       >
-        {mut.isPending ? 'Saving…' : 'Save checkpoint'}
+        {mut.isPending ? 'Saving…' : 'Save check-in'}
+      </button>
+    </form>
+  );
+}
+
+function TemperatureForm({ onSuccess }: { onSuccess: () => void }) {
+  const userId = getUserId();
+  const qc = useQueryClient();
+  const now = new Date();
+
+  const [value, setValue] = useState('');
+  const [measuredAt, setMeasuredAt] = useState(toDatetimeLocal(now));
+  const [error, setError] = useState('');
+
+  const mut = useMutation({
+    mutationFn: () => {
+      const v = parseFloat(value);
+      if (isNaN(v)) throw new Error('Invalid value');
+      return createMeasurement({
+        user_id: userId,
+        metric_type_slug: TEMPERATURE_METRIC.slug,
+        source_slug: 'manual',
+        value_num: v,
+        unit: TEMPERATURE_METRIC.unit,
+        measured_at: localToISO(measuredAt),
+        recorded_at: nowISO(),
+        aggregation_level: 'spot',
+      });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['measurements'] });
+      qc.invalidateQueries({ queryKey: ['today-v2'] });
+      onSuccess();
+    },
+    onError: (e: Error) => setError(e.message),
+  });
+
+  return (
+    <form
+      data-testid="capture-temperature-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        setError('');
+        mut.mutate();
+      }}
+      className="space-y-4"
+    >
+      <div>
+        <label className="block text-xs text-gray-500 mb-1">
+          Temperature ({TEMPERATURE_METRIC.unit})
+        </label>
+        <div className="flex gap-2 items-center">
+          <input
+            type="number"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            step={TEMPERATURE_METRIC.step}
+            min={TEMPERATURE_METRIC.min}
+            max={TEMPERATURE_METRIC.max}
+            placeholder="e.g. 37.0"
+            className="flex-1 text-sm border-gray-200 rounded"
+            required
+          />
+          <span className="text-sm text-gray-400 font-mono px-2">{TEMPERATURE_METRIC.unit}</span>
+        </div>
+      </div>
+
+      <div>
+        <label className="block text-xs text-gray-500 mb-1">Measured at</label>
+        <input
+          type="datetime-local"
+          value={measuredAt}
+          onChange={(e) => setMeasuredAt(e.target.value)}
+          className="w-full text-sm border-gray-200 rounded"
+        />
+      </div>
+
+      {error && <p className="text-xs text-red-500">{error}</p>}
+
+      <button
+        type="submit"
+        disabled={mut.isPending}
+        className="w-full bg-gray-900 text-white text-sm py-2 rounded hover:bg-gray-700 disabled:opacity-50 transition-colors"
+      >
+        {mut.isPending ? 'Saving…' : 'Log temperature'}
       </button>
     </form>
   );
@@ -181,14 +321,22 @@ function SymptomForm({ onSuccess }: { onSuccess: () => void }) {
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['symptomLogs'] });
-      qc.invalidateQueries({ queryKey: ['summary', userId] });
+      qc.invalidateQueries({ queryKey: ['today-v2'] });
       onSuccess();
     },
     onError: (e: Error) => setError(e.message),
   });
 
   return (
-    <form onSubmit={(e) => { e.preventDefault(); setError(''); mut.mutate(); }} className="space-y-4">
+    <form
+      data-testid="capture-symptom-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        setError('');
+        mut.mutate();
+      }}
+      className="space-y-4"
+    >
       <div>
         <label className="block text-xs text-gray-500 mb-1">Symptom</label>
         <select
@@ -197,7 +345,9 @@ function SymptomForm({ onSuccess }: { onSuccess: () => void }) {
           className="w-full text-sm border-gray-200 rounded"
         >
           {SYMPTOM_SLUGS.map((s) => (
-            <option key={s.slug} value={s.slug}>{s.label}</option>
+            <option key={s.slug} value={s.slug}>
+              {s.label}
+            </option>
           ))}
         </select>
       </div>
@@ -267,7 +417,7 @@ function MedLogForm({ onSuccess }: { onSuccess: () => void }) {
   const now = new Date();
 
   const { data: regimens, isLoading } = useQuery({
-    queryKey: ['activeRegimens', userId],
+    queryKey: ['today-v2', 'regimens', userId],
     queryFn: () => fetchActiveRegimens(userId),
     enabled: !!userId,
   });
@@ -293,28 +443,36 @@ function MedLogForm({ onSuccess }: { onSuccess: () => void }) {
       });
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['medLogs'] });
-      qc.invalidateQueries({ queryKey: ['summary', userId] });
-      qc.invalidateQueries({ queryKey: ['adherence', userId] });
+      qc.invalidateQueries({ queryKey: ['today-v2'] });
       onSuccess();
     },
     onError: (e: Error) => setError(e.message),
   });
 
   if (isLoading) return <p className="text-xs text-gray-400">Loading regimens…</p>;
+
   if (!items.length) {
     return (
-      <div className="space-y-2 py-1">
+      <div data-testid="capture-medlog-empty" className="space-y-2 py-1">
         <p className="text-xs text-gray-600 font-medium">No active medication regimens</p>
         <p className="text-xs text-gray-400">
-          Go to the <span className="font-medium text-gray-600">Meds</span> tab in the navigation bar to create one.
+          Go to <span className="font-medium text-gray-600">Meds</span> in the navigation to create
+          one.
         </p>
       </div>
     );
   }
 
   return (
-    <form onSubmit={(e) => { e.preventDefault(); setError(''); mut.mutate(); }} className="space-y-4">
+    <form
+      data-testid="capture-medlog-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        setError('');
+        mut.mutate();
+      }}
+      className="space-y-4"
+    >
       <div>
         <label className="block text-xs text-gray-500 mb-1">Medication</label>
         <select
@@ -372,162 +530,166 @@ function MedLogForm({ onSuccess }: { onSuccess: () => void }) {
   );
 }
 
-function MeasurementForm({ onSuccess }: { onSuccess: () => void }) {
+function ScaleSection() {
   const userId = getUserId();
   const qc = useQueryClient();
-  const now = new Date();
+  const abortRef = useRef<AbortController | null>(null);
 
-  const [metricIdx, setMetricIdx] = useState(0);
-  const [value, setValue] = useState('');
-  const [measuredAt, setMeasuredAt] = useState(toDatetimeLocal(now));
-  const [error, setError] = useState('');
-
-  const metric = MANUAL_METRICS[metricIdx];
+  const [msg, setMsg] = useState('');
+  const [countdown, setCountdown] = useState<number | null>(null);
 
   const mut = useMutation({
     mutationFn: () => {
-      const v = parseFloat(value);
-      if (isNaN(v)) throw new Error('Invalid value');
-      return createMeasurement({
-        user_id: userId,
-        metric_type_slug: metric.slug,
-        source_slug: 'manual',
-        value_num: v,
-        unit: metric.unit,
-        measured_at: localToISO(measuredAt),
-        recorded_at: nowISO(),
-        aggregation_level: 'spot',
-      });
+      setMsg('');
+      abortRef.current = new AbortController();
+      return scanScale(
+        userId,
+        abortRef.current.signal,
+        loadScaleProfile(),
+        loadScaleDevice()?.mac,
+      );
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
+      setMsg(data.message || 'Import complete');
+      qc.invalidateQueries({ queryKey: ['today-v2'] });
+      qc.invalidateQueries({ queryKey: ['scale-latest'] });
       qc.invalidateQueries({ queryKey: ['measurements'] });
-      qc.invalidateQueries({ queryKey: ['summary', userId] });
-      onSuccess();
+      qc.invalidateQueries({ queryKey: ['freshness-scale'] });
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => {
+      if (e.name !== 'AbortError') setMsg(e.message);
+    },
+    onSettled: () => setCountdown(null),
   });
 
+  useEffect(() => {
+    if (!mut.isPending) {
+      setCountdown(null);
+      return;
+    }
+    let remaining = SCAN_TIMEOUT_S;
+    setCountdown(remaining);
+    const id = setInterval(() => {
+      remaining -= 1;
+      setCountdown(remaining <= 0 ? 0 : remaining);
+      if (remaining <= 0) clearInterval(id);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [mut.isPending]);
+
   return (
-    <form onSubmit={(e) => { e.preventDefault(); setError(''); mut.mutate(); }} className="space-y-4">
-      <div>
-        <label className="block text-xs text-gray-500 mb-1">Metric</label>
-        <select
-          value={metricIdx}
-          onChange={(e) => { setMetricIdx(Number(e.target.value)); setValue(''); }}
-          className="w-full text-sm border-gray-200 rounded"
-        >
-          {MANUAL_METRICS.map((m, i) => (
-            <option key={m.slug} value={i}>{m.label}</option>
-          ))}
-        </select>
-      </div>
-
-      <div>
-        <label className="block text-xs text-gray-500 mb-1">
-          Value ({metric.unit})
-        </label>
-        <div className="flex gap-2">
-          <input
-            type="number"
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            step={metric.step}
-            min={metric.min}
-            max={metric.max}
-            placeholder="e.g. 37.0"
-            className="flex-1 text-sm border-gray-200 rounded"
-            required
-          />
-          <span className="flex items-center text-sm text-gray-400 font-mono px-2">
-            {metric.unit}
-          </span>
-        </div>
-      </div>
-
-      <div>
-        <label className="block text-xs text-gray-500 mb-1">Measured at</label>
-        <input
-          type="datetime-local"
-          value={measuredAt}
-          onChange={(e) => setMeasuredAt(e.target.value)}
-          className="w-full text-sm border-gray-200 rounded"
-        />
-      </div>
-
-      {error && <p className="text-xs text-red-500">{error}</p>}
-
+    <div data-testid="capture-scale-section" className="space-y-4">
+      <p className="text-xs text-gray-500">
+        Power on your HC900 scale and keep it within Bluetooth range.
+      </p>
       <button
-        type="submit"
+        type="button"
+        onClick={() => mut.mutate()}
         disabled={mut.isPending}
         className="w-full bg-gray-900 text-white text-sm py-2 rounded hover:bg-gray-700 disabled:opacity-50 transition-colors"
       >
-        {mut.isPending ? 'Saving…' : 'Save measurement'}
+        {mut.isPending ? `Scanning… ${countdown ?? SCAN_TIMEOUT_S}s` : 'Scan scale'}
       </button>
-    </form>
+      {msg && (
+        <p className={`text-xs font-mono ${mut.isSuccess ? 'text-green-600' : 'text-red-500'}`}>
+          {msg}
+        </p>
+      )}
+    </div>
   );
 }
 
-const TABS: { id: Tab; label: string }[] = [
-  { id: 'checkpoint', label: 'Check-in' },
-  { id: 'symptom', label: 'Symptom' },
-  { id: 'medlog', label: 'Med Log' },
-  { id: 'measurement', label: 'Measure' },
-];
+// ── Surface ───────────────────────────────────────────────────────────────
 
-export default function QuickInputModal({
+export default function CaptureSurface({
+  initialSection = 'checkpoint',
   onClose,
-  initialTab,
 }: {
+  initialSection?: CaptureSection;
   onClose: () => void;
-  initialTab?: Tab;
 }) {
-  const [tab, setTab] = useState<Tab>(initialTab ?? 'checkpoint');
-  const [success, setSuccess] = useState(false);
+  const [section, setSection] = useState<CaptureSection>(initialSection);
+  const [savedSection, setSavedSection] = useState<CaptureSection | null>(null);
 
-  const handleSuccess = () => {
-    setSuccess(true);
-    setTimeout(() => { setSuccess(false); onClose(); }, 1200);
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  const handleSaved = (s: CaptureSection) => {
+    setSavedSection(s);
+    setTimeout(() => setSavedSection(null), 1500);
+  };
+
+  const switchSection = (s: CaptureSection) => {
+    setSavedSection(null);
+    setSection(s);
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
-      <div className="relative bg-white rounded-t-2xl sm:rounded-xl w-full sm:max-w-md max-h-[90vh] overflow-y-auto shadow-xl">
-        <div className="flex items-center justify-between px-4 pt-4 pb-3 border-b border-gray-100">
-          <h2 className="text-sm font-semibold text-gray-900">Quick Input</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-lg leading-none">&#x2715;</button>
-        </div>
+    <div className="fixed inset-0 z-50 flex flex-col bg-white" data-testid="capture-surface">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 h-12 border-b border-gray-100 shrink-0">
+        <h2 className="text-sm font-semibold text-gray-900">Log</h2>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close log"
+          className="text-gray-400 hover:text-gray-700 text-lg leading-none"
+        >
+          &#x2715;
+        </button>
+      </div>
 
-        <div className="flex gap-1 px-4 pt-3 pb-1">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={`px-3 py-1 text-xs rounded-full transition-colors ${
-                tab === t.id
-                  ? 'bg-gray-900 text-white'
-                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-              }`}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
+      {/* Section strip */}
+      <div
+        className="flex gap-1.5 px-4 py-3 border-b border-gray-100 overflow-x-auto shrink-0"
+        data-testid="capture-section-strip"
+      >
+        {SECTIONS.map((s) => (
+          <button
+            key={s.id}
+            type="button"
+            onClick={() => switchSection(s.id)}
+            data-section={s.id}
+            aria-pressed={section === s.id}
+            className={`px-3 py-1 text-xs rounded-full whitespace-nowrap transition-colors ${
+              section === s.id
+                ? 'bg-gray-900 text-white'
+                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+            }`}
+          >
+            {s.label}
+          </button>
+        ))}
+      </div>
 
-        <div className="px-4 py-4">
-          {success ? (
-            <div className="text-center py-6">
-              <p className="text-green-600 font-medium text-sm">&#x2713; Saved</p>
-            </div>
-          ) : (
-            <>
-              {tab === 'checkpoint' && <CheckpointForm onSuccess={handleSuccess} />}
-              {tab === 'symptom' && <SymptomForm onSuccess={handleSuccess} />}
-              {tab === 'medlog' && <MedLogForm onSuccess={handleSuccess} />}
-              {tab === 'measurement' && <MeasurementForm onSuccess={handleSuccess} />}
-            </>
-          )}
-        </div>
+      {/* Form area */}
+      <div className="flex-1 overflow-y-auto px-4 py-5 max-w-lg mx-auto w-full">
+        {savedSection === section ? (
+          <div className="text-center py-10" data-testid="capture-saved-feedback">
+            <p className="text-green-600 font-medium text-sm">&#x2713; Saved</p>
+          </div>
+        ) : (
+          <>
+            {section === 'checkpoint' && (
+              <CheckpointForm onSuccess={() => handleSaved('checkpoint')} />
+            )}
+            {section === 'measurement' && (
+              <TemperatureForm onSuccess={() => handleSaved('measurement')} />
+            )}
+            {section === 'symptom' && (
+              <SymptomForm onSuccess={() => handleSaved('symptom')} />
+            )}
+            {section === 'medlog' && (
+              <MedLogForm onSuccess={() => handleSaved('medlog')} />
+            )}
+            {section === 'scale' && <ScaleSection />}
+          </>
+        )}
       </div>
     </div>
   );

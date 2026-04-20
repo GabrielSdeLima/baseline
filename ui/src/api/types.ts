@@ -135,6 +135,12 @@ export interface MeasurementResponse {
   metric_type_slug: string | null;
   metric_type_name: string | null;
   source_slug: string | null;
+  // FIXME: backend serializes Decimal as a JSON string (e.g. "78.12"), but this
+  // field is typed as number. Consumers must coerce with Number(...) before
+  // calling number methods (toFixed, arithmetic). Normalize at the fetch
+  // boundary — parse in fetchMeasurements (api/client.ts) so downstream code
+  // can trust the type. Tracked as follow-up after checkpoints 500 diagnosis
+  // (2026-04-18); deferred to avoid scope creep.
   value_num: number;
   unit: string;
   measured_at: string;
@@ -209,6 +215,29 @@ export interface MedicationRegimenList {
   limit: number;
 }
 
+// ── Medication logs ───────────────────────────────────────────────────────
+
+export interface MedicationLogResponse {
+  id: string;
+  user_id: string;
+  regimen_id: string;
+  status: string;
+  scheduled_at: string;
+  taken_at: string | null;
+  dosage_amount: number | null;
+  dosage_unit: string | null;
+  notes: string | null;
+  recorded_at: string;
+  ingested_at: string;
+}
+
+export interface MedicationLogList {
+  items: MedicationLogResponse[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
 // ── Onda 3 B1 System Status ───────────────────────────────────────────────
 
 export type AgentStatus = 'active' | 'stale' | 'unknown';
@@ -235,6 +264,22 @@ export interface SystemStatusResponse {
   sources: SystemSourceStatus[];
   agents: SystemAgentSummary[];
   as_of: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type GarminSyncStatus =
+  | 'completed'
+  | 'no_new_data'
+  | 'failed'
+  | 'already_running';
+
+export interface GarminSyncResponse {
+  status: GarminSyncStatus;
+  run_id: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  error_message: string | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,290 +1,287 @@
-import { useQuery } from '@tanstack/react-query';
+import { useEffect, useRef, useState } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { getUserId } from '../config';
-import {
-  fetchSummary,
-  fetchDeviations,
-  fetchMedicationAdherence,
-  fetchMeasurements,
-  fetchLatestScaleReading,
-  nDaysAgoISO,
-  todayISO,
-} from '../api/client';
-import InsightCard from '../components/InsightCard';
-import SignalBadge from '../components/SignalBadge';
-import FreshnessBar from '../components/FreshnessBar';
-import ScaleReadingCard from '../components/ScaleReadingCard';
-import { availabilityLabel } from '../lib/availabilityLabel';
+import { scanScale, syncGarmin, createMedicationLog, nowISO } from '../api/client';
+import type { GarminSyncResponse, GarminSyncStatus, MedicationRegimenList } from '../api/types';
+import { loadScaleProfile } from '../lib/scaleProfile';
+import { loadScaleDevice } from '../lib/scaleDevice';
+import type { CaptureSection } from '../components/CaptureSurface';
+import { useTodayViewModel } from '../features/today/useTodayViewModel';
+import TodayHeroCard from '../features/today/components/TodayHeroCard';
+import TodayActionsList from '../features/today/components/TodayActionsList';
+import TodayCompletionCard from '../features/today/components/TodayCompletionCard';
+import TodayBlockersCard from '../features/today/components/TodayBlockersCard';
+import TodayTrustCard from '../features/today/components/TodayTrustCard';
+import type { ProtocolKind } from '../features/today/types';
 
-type TrendDir = '↑' | '↓' | '→';
+const SCAN_TIMEOUT_S = 45;
 
-interface HrvTrend {
-  dir: TrendDir;
-  streakDays: number;
-  latestMs: number | null;
-}
-
-function computeHrvTrend(items: Array<{ measured_at: string; value_num: number }>): HrvTrend | null {
-  const sorted = [...items]
-    .sort((a, b) => a.measured_at.localeCompare(b.measured_at))
-    .map((m) => Number(m.value_num));
-  if (sorted.length < 2) return null;
-  const latest = sorted[sorted.length - 1];
-  const prev = sorted.slice(0, -1);
-  const prevAvg = prev.reduce((s, v) => s + v, 0) / prev.length;
-  const pct = (latest - prevAvg) / prevAvg;
-  const dir: TrendDir = pct > 0.03 ? '↑' : pct < -0.03 ? '↓' : '→';
-
-  let streak = 1;
-  for (let i = sorted.length - 2; i >= 1; i--) {
-    const d = sorted[i] - sorted[i - 1];
-    const dDir: TrendDir = d / sorted[i - 1] > 0.03 ? '↑' : d / sorted[i - 1] < -0.03 ? '↓' : '→';
-    if (dDir === dir) streak++;
-    else break;
-  }
-  return { dir, streakDays: streak, latestMs: latest };
-}
-
-const METRIC_UNITS: Record<string, string> = {
-  hrv_rmssd: 'ms',
-  resting_hr: 'bpm',
-  body_temperature: '°C',
-  weight: 'kg',
-  sleep_duration: 'min',
-  sleep_score: '',
-  steps: '',
-  active_calories: 'kcal',
-  stress_level: '',
-  spo2: '%',
-  respiratory_rate: 'brpm',
-  body_battery: '',
+const KIND_TO_SECTION: Partial<Record<ProtocolKind, CaptureSection>> = {
+  check_in: 'checkpoint',
+  check_out: 'checkpoint',
+  symptoms: 'symptom',
+  temperature: 'measurement',
 };
 
-export default function Today() {
+function noteForGarminStatus(r: GarminSyncResponse): string {
+  switch (r.status) {
+    case 'completed':
+      return 'synced';
+    case 'no_new_data':
+      return 'no new data';
+    case 'already_running':
+      return 'already running';
+    case 'failed':
+      return `failed: ${r.error_message ?? 'unknown error'}`;
+  }
+}
+
+interface Props {
+  onOpenCapture: (section?: CaptureSection) => void;
+  onGoToSettings: () => void;
+}
+
+export default function Today({ onOpenCapture, onGoToSettings }: Props) {
   const userId = getUserId();
-  const today = todayISO();
-  const start14 = nDaysAgoISO(14);
+  const qc = useQueryClient();
+  const { vm, isLoading, isFullyErrored, queryErrors } = useTodayViewModel({ userId });
 
-  const summaryQ = useQuery({
-    queryKey: ['summary', userId],
-    queryFn: () => fetchSummary(userId),
-    enabled: !!userId,
-    staleTime: 5 * 60 * 1000,
+  const [pendingActionId, setPendingActionId] = useState<string | undefined>(undefined);
+  const [scanMsg, setScanMsg] = useState('');
+  const [scanCountdown, setScanCountdown] = useState<number | null>(null);
+  const [garminSyncOutcome, setGarminSyncOutcome] = useState<
+    { status: GarminSyncStatus; note: string } | null
+  >(null);
+  const [medConfirmNote, setMedConfirmNote] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const scaleMut = useMutation({
+    mutationFn: () => {
+      abortRef.current = new AbortController();
+      return scanScale(
+        userId,
+        abortRef.current.signal,
+        loadScaleProfile(),
+        loadScaleDevice()?.mac,
+      );
+    },
+    onSuccess: (data) => {
+      setScanMsg(data.message);
+      qc.invalidateQueries({ queryKey: ['today-v2'] });
+      qc.invalidateQueries({ queryKey: ['scale-latest'] });
+      qc.invalidateQueries({ queryKey: ['measurements'] });
+      qc.invalidateQueries({ queryKey: ['freshness-scale'] });
+      setTimeout(() => setScanMsg(''), 5000);
+    },
+    onError: (e: Error) => {
+      if (e.name !== 'AbortError') {
+        setScanMsg(e.message);
+        setTimeout(() => setScanMsg(''), 8000);
+      }
+    },
+    onSettled: () => setPendingActionId(undefined),
   });
 
-  const deviationsQ = useQuery({
-    queryKey: ['deviations', userId, start14, today],
-    queryFn: () => fetchDeviations(userId, start14, today),
-    enabled: !!userId,
-    staleTime: 5 * 60 * 1000,
+  const garminRefreshMut = useMutation({
+    mutationFn: () => syncGarmin(userId),
+    onSuccess: async (data: GarminSyncResponse) => {
+      setGarminSyncOutcome({ status: data.status, note: noteForGarminStatus(data) });
+      // Only re-fetch queries when the server actually touched data — a failed
+      // or already_running response would otherwise burn a round-trip for no
+      // change.  no_new_data still invalidates: the user asked for fresh data
+      // and we want the UI to reflect today's run metadata even if Garmin had
+      // nothing new to publish.
+      if (data.status === 'completed' || data.status === 'no_new_data') {
+        await Promise.all([
+          qc.invalidateQueries({ queryKey: ['today-v2', 'measurements', userId, 'hrv_rmssd'] }),
+          qc.invalidateQueries({ queryKey: ['today-v2', 'measurements', userId, 'resting_hr'] }),
+          qc.invalidateQueries({ queryKey: ['today-v2', 'system-status', userId] }),
+          qc.invalidateQueries({ queryKey: ['freshness-garmin', userId] }),
+          qc.invalidateQueries({ queryKey: ['system-status', userId] }),
+        ]);
+      }
+      setTimeout(() => setGarminSyncOutcome(null), 5000);
+    },
+    onError: (e: Error) => {
+      setGarminSyncOutcome({ status: 'failed', note: `failed: ${e.message}` });
+      setTimeout(() => setGarminSyncOutcome(null), 8000);
+    },
+    onSettled: () => setPendingActionId(undefined),
   });
 
-  const adherenceQ = useQuery({
-    queryKey: ['adherence', userId],
-    queryFn: () => fetchMedicationAdherence(userId),
-    enabled: !!userId,
-    staleTime: 5 * 60 * 1000,
+  const confirmMedsMut = useMutation({
+    mutationFn: async () => {
+      const regimens =
+        qc.getQueryData<MedicationRegimenList>(['today-v2', 'regimens', userId])?.items ?? [];
+      if (regimens.length === 0) throw new Error('no active regimens in cache');
+      const now = nowISO();
+      await Promise.all(
+        regimens.map((r) =>
+          createMedicationLog({
+            user_id: userId,
+            regimen_id: r.id,
+            status: 'taken',
+            scheduled_at: now,
+            taken_at: now,
+            recorded_at: now,
+          }),
+        ),
+      );
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['today-v2', 'med-logs', userId] });
+      setMedConfirmNote('logged');
+      setTimeout(() => setMedConfirmNote(null), 5000);
+    },
+    onError: (e: Error) => {
+      setMedConfirmNote(`failed: ${e.message}`);
+      setTimeout(() => setMedConfirmNote(null), 8000);
+    },
+    onSettled: () => setPendingActionId(undefined),
   });
 
-  const hrvCountQ = useQuery({
-    queryKey: ['measurements', userId, 'hrv_rmssd', 14],
-    queryFn: () => fetchMeasurements(userId, 'hrv_rmssd', 14),
-    enabled: !!userId,
-    staleTime: 5 * 60 * 1000,
-  });
+  useEffect(() => {
+    if (!scaleMut.isPending) {
+      setScanCountdown(null);
+      return;
+    }
+    let remaining = SCAN_TIMEOUT_S;
+    setScanCountdown(remaining);
+    const id = setInterval(() => {
+      remaining -= 1;
+      setScanCountdown(remaining <= 0 ? 0 : remaining);
+      if (remaining <= 0) clearInterval(id);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [scaleMut.isPending]);
 
-  const scaleLatestQ = useQuery({
-    queryKey: ['scale-latest', userId],
-    queryFn: () => fetchLatestScaleReading(userId),
-    enabled: !!userId,
-    staleTime: 5 * 60 * 1000,
-  });
+  function handleExecuteAction(actionId: string) {
+    const action = vm.priorityActions.find((a) => a.id === actionId);
+    if (!action) return;
 
-  const summary = summaryQ.data;
+    if (action.kind === 'weight') {
+      setPendingActionId(actionId);
+      scaleMut.mutate();
+      return;
+    }
+    if (action.kind === 'garmin') {
+      setPendingActionId(actionId);
+      garminRefreshMut.mutate();
+      return;
+    }
+    if (action.kind === 'medication') {
+      setPendingActionId(actionId);
+      confirmMedsMut.mutate();
+      return;
+    }
+    const section = KIND_TO_SECTION[action.kind];
+    if (section) onOpenCapture(section);
+  }
 
-  const hrvTrend = hrvCountQ.data?.items.length
-    ? computeHrvTrend(hrvCountQ.data.items)
-    : null;
+  function handleResolveBlocker(_blockerId: string) {
+    onGoToSettings();
+  }
 
-  const todayDeviations = deviationsQ.data?.deviations.filter(
-    (d) => d.day === today
-  ) ?? [];
+  if (isLoading) {
+    return (
+      <div className="space-y-3" data-testid="today-loading">
+        <div className="bg-white border border-gray-200 rounded-lg p-4 animate-pulse">
+          <div className="h-3 bg-gray-100 rounded w-1/3 mb-3" />
+          <div className="h-5 bg-gray-100 rounded w-2/3 mb-2" />
+          <div className="h-3 bg-gray-100 rounded w-1/2" />
+        </div>
+        <div className="bg-white border border-gray-200 rounded-lg p-4 animate-pulse">
+          <div className="h-3 bg-gray-100 rounded w-1/4 mb-2" />
+          <div className="h-3 bg-gray-100 rounded w-full" />
+        </div>
+      </div>
+    );
+  }
 
-  const formatDelta = (d: {
-    metric_slug: string;
-    metric_name: string;
-    value: number;
-    z_score: number;
-    delta_abs: number;
-  }) => {
-    const sign = d.delta_abs > 0 ? '+' : '';
-    const z = Number(d.z_score).toFixed(1);
-    const unit = METRIC_UNITS[d.metric_slug] ?? '';
-    const unitStr = unit ? ` ${unit}` : '';
-    return `${d.metric_name}  z=${z}  (${sign}${Math.round(Number(d.delta_abs))}${unitStr})`;
-  };
+  if (isFullyErrored) {
+    return (
+      <div
+        data-testid="today-error"
+        className="bg-white border border-red-200 rounded-lg p-4"
+      >
+        <p className="text-sm text-red-700 font-medium">Could not load today</p>
+        <ul className="mt-2 text-xs text-gray-500 space-y-1 font-mono">
+          {queryErrors.slice(0, 5).map((e) => (
+            <li key={e.source}>
+              · {e.source}: {e.error.message}
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-3">
-      <FreshnessBar userId={userId} />
+      {queryErrors.length > 0 && (
+        <div
+          data-testid="today-partial-error"
+          className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2"
+        >
+          <p className="text-xs text-amber-800">
+            Some sources failed — rendering with what loaded.
+          </p>
+          <ul className="mt-1 text-[10px] text-amber-700 font-mono space-y-0.5">
+            {queryErrors.slice(0, 5).map((e) => (
+              <li key={e.source}>· {e.source}: {e.error.message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
-      {/* Illness Signal — Experimental */}
-      <InsightCard
-        title="Illness Signal"
-        stability="experimental"
-        method="baseline_deviation_v1"
-        isLoading={summaryQ.isLoading}
-        error={summaryQ.error as Error | null}
-      >
-        {summary && (
-          summary.block_availability.illness === 'ok' || summary.block_availability.illness === 'partial' ? (
-            <div>
-              <SignalBadge signal={summary.illness_signal} />
-              {summary.block_availability.illness === 'partial' && (
-                <p className="text-xs text-amber-500 mt-1">partial coverage</p>
-              )}
-              {summary.block_availability.illness === 'ok' && hrvTrend && (
-                <p className="text-xs text-gray-400 mt-1 font-mono">
-                  HRV {hrvTrend.dir} {hrvTrend.streakDays}d
-                  {hrvTrend.latestMs != null && (
-                    <span className="ml-1">· {Math.round(hrvTrend.latestMs)} ms</span>
-                  )}
-                </p>
-              )}
-            </div>
-          ) : (
-            <p className="text-sm text-gray-500">
-              {availabilityLabel(summary.block_availability.illness)}
-            </p>
-          )
-        )}
-      </InsightCard>
-
-      {/* Recovery Status — Experimental */}
-      <InsightCard
-        title="Recovery Status"
-        stability="experimental"
-        method="load_hrv_heuristic_v1"
-        isLoading={summaryQ.isLoading}
-        error={summaryQ.error as Error | null}
-      >
-        {summary && (
-          summary.block_availability.recovery === 'ok' || summary.block_availability.recovery === 'partial' ? (
-            <div>
-              <SignalBadge signal={summary.recovery_status} />
-              {summary.block_availability.recovery === 'partial' && (
-                <p className="text-xs text-amber-500 mt-1">partial coverage</p>
-              )}
-              {summary.block_availability.recovery === 'ok' && hrvTrend && (
-                <p className="text-xs text-gray-400 mt-1 font-mono">
-                  HRV {hrvTrend.dir} {hrvTrend.streakDays}d
-                  {hrvTrend.latestMs != null && (
-                    <span className="ml-1">· {Math.round(hrvTrend.latestMs)} ms</span>
-                  )}
-                </p>
-              )}
-            </div>
-          ) : (
-            <p className="text-sm text-gray-500">
-              {availabilityLabel(summary.block_availability.recovery)}
-            </p>
-          )
-        )}
-      </InsightCard>
-
-      {/* Physiological Deviations — Stable */}
-      <InsightCard
-        title="Physiological Deviations"
-        stability="stable"
-        isLoading={summaryQ.isLoading || deviationsQ.isLoading || hrvCountQ.isLoading}
-        error={(summaryQ.error ?? deviationsQ.error) as Error | null}
-      >
-        {summary && (
-          <div>
-            {summary.block_availability.deviations !== 'ok' ? (
-              <p className="text-sm text-gray-500">
-                {availabilityLabel(summary.block_availability.deviations)}
-                {summary.block_availability.deviations === 'insufficient_data' && (
-                  <span className="block text-xs text-gray-400 mt-0.5">
-                    {hrvCountQ.data?.total ?? 0} of 3 HRV readings collected
-                  </span>
-                )}
-              </p>
-            ) : (
-              <>
-                <p className="text-sm text-gray-900">
-                  {summary.active_deviations === 0
-                    ? 'All metrics within baseline'
-                    : `${summary.active_deviations} metric${summary.active_deviations > 1 ? 's' : ''} outside baseline`}
-                </p>
-                {todayDeviations.length > 0 && (
-                  <ul className="mt-2 space-y-1">
-                    {todayDeviations.map((d) => (
-                      <li key={d.metric_slug} className="text-xs font-mono text-gray-600">
-                        · {formatDelta(d)}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {summary.active_deviations > 0 && todayDeviations.length === 0 && (
-                  <p className="text-xs text-gray-400 mt-1">deviations in recent window, none today</p>
-                )}
-              </>
-            )}
-            <p className="text-xs text-gray-400 mt-2">
-              threshold |z| &gt; {deviationsQ.data?.deviation_threshold ?? '2.0'} · {deviationsQ.data?.baseline_window_days ?? 14}d window
-            </p>
-          </div>
-        )}
-      </InsightCard>
-
-      {/* Symptom Burden — Stable */}
-      <InsightCard
-        title="Symptom Burden"
-        stability="stable"
-        isLoading={summaryQ.isLoading}
-        error={summaryQ.error as Error | null}
-      >
-        {summary && (
-          <div>
-            {summary.block_availability.symptoms === 'not_applicable' ? (
-              <p className="text-sm text-gray-400">Symptom tracking not started</p>
-            ) : (
-              <p className="text-sm text-gray-900">
-                {Number(summary.current_symptom_burden) === 0
-                  ? 'No symptoms today'
-                  : `Burden: ${Number(summary.current_symptom_burden).toFixed(1)}`}
-              </p>
-            )}
-          </div>
-        )}
-      </InsightCard>
-
-      {/* Latest Scale Reading — Stable */}
-      <ScaleReadingCard
-        data={scaleLatestQ.data}
-        isLoading={scaleLatestQ.isLoading}
-        error={scaleLatestQ.error as Error | null}
+      <TodayHeroCard
+        vm={vm}
+        onExecuteAction={handleExecuteAction}
+        onResolveBlocker={handleResolveBlocker}
+        actionPending={pendingActionId}
       />
 
-      {/* Medication Adherence — Stable */}
-      <InsightCard
-        title="Medication Adherence"
-        stability="stable"
-        isLoading={adherenceQ.isLoading}
-        error={adherenceQ.error as Error | null}
-      >
-        <div>
-          {adherenceQ.data?.availability_status === 'not_applicable' ? (
-            <p className="text-sm text-gray-400">No active regimens</p>
-          ) : adherenceQ.data?.overall_adherence_pct == null ? (
-            <p className="text-sm text-gray-400">Regimen active, waiting for first log</p>
-          ) : (
-            <p className="text-sm text-gray-900">
-              {Number(adherenceQ.data.overall_adherence_pct).toFixed(0)}% overall
-            </p>
-          )}
+      <TodayActionsList
+        actions={vm.priorityActions}
+        onExecuteAction={handleExecuteAction}
+        actionPending={pendingActionId}
+      />
+
+      {(scanMsg || scanCountdown !== null) && (
+        <div className="text-[11px] text-gray-500 font-mono bg-gray-50 border border-gray-100 rounded px-3 py-1.5">
+          {scaleMut.isPending
+            ? `Scale scanning… ${scanCountdown ?? SCAN_TIMEOUT_S}s`
+            : scanMsg}
         </div>
-      </InsightCard>
+      )}
+
+      {medConfirmNote && (
+        <div className="text-[11px] text-gray-500 font-mono bg-gray-50 border border-gray-100 rounded px-3 py-1.5">
+          Meds · {medConfirmNote}
+        </div>
+      )}
+
+      <TodayBlockersCard
+        blockers={vm.blockers}
+        onResolveBlocker={handleResolveBlocker}
+      />
+
+      <TodayCompletionCard items={vm.completion} />
+
+      <TodayTrustCard
+        trust={vm.trust}
+        onRefreshGarmin={() => {
+          setPendingActionId('refresh-garmin');
+          garminRefreshMut.mutate();
+        }}
+        refreshPending={garminRefreshMut.isPending}
+        lastRefreshNote={garminSyncOutcome?.note ?? null}
+        refreshStatus={garminSyncOutcome?.status ?? null}
+      />
+
+      <p className="text-[10px] text-gray-400 font-mono text-center pt-2">
+        Refresh Garmin triggers an on-demand sync.
+      </p>
     </div>
   );
 }

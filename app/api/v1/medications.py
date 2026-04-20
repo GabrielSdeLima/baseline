@@ -1,4 +1,5 @@
 import uuid
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -95,10 +96,14 @@ async def create_medication_log(
 @router.get("/logs", response_model=MedicationLogList)
 async def list_medication_logs(
     user_id: uuid.UUID,
+    start_date: date | None = Query(None, description="Filter: logs with scheduled_at >= this date (UTC)"),
+    end_date: date | None = Query(None, description="Filter: logs with scheduled_at <= this date (UTC)"),
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
 ):
     svc = MedicationService(db)
-    items, total = await svc.list_logs(user_id, offset=offset, limit=limit)
+    items, total = await svc.list_logs(
+        user_id, start_date=start_date, end_date=end_date, offset=offset, limit=limit
+    )
     return MedicationLogList(items=items, total=total, offset=offset, limit=limit)

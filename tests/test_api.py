@@ -175,3 +175,113 @@ class TestCheckpointsAPI:
         assert r1.status_code == 201
         r2 = await client.post("/api/v1/checkpoints/", json=payload)
         assert r2.status_code == 422
+
+    # ── GET coverage — locks in the Today v2 read flow ────────────────────
+
+    async def test_list_empty_200(self, client: httpx.AsyncClient, user: User):
+        """Today v2 hits this on first paint — must not 500 on empty data."""
+        today = str(date.today())
+        resp = await client.get(
+            "/api/v1/checkpoints/",
+            params={
+                "user_id": str(user.id),
+                "start_date": today,
+                "end_date": today,
+                "limit": 14,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {"items": [], "total": 0, "offset": 0, "limit": 14}
+
+    async def test_list_round_trip_shape(self, client: httpx.AsyncClient, user: User):
+        """POST → GET round-trip returns the exact shape Today v2 consumes
+        (all fields required by DailyCheckpointResponse present and non-null
+        where the schema requires it)."""
+        now = datetime.now(UTC).isoformat()
+        today = str(date.today())
+        created = await client.post(
+            "/api/v1/checkpoints/",
+            json={
+                "user_id": str(user.id),
+                "checkpoint_type": "morning",
+                "checkpoint_date": today,
+                "checkpoint_at": now,
+                "recorded_at": now,
+                "mood": 7,
+                "energy": 8,
+                "sleep_quality": 7,
+            },
+        )
+        assert created.status_code == 201
+
+        resp = await client.get(
+            "/api/v1/checkpoints/",
+            params={
+                "user_id": str(user.id),
+                "start_date": today,
+                "end_date": today,
+                "limit": 14,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 1
+        item = body["items"][0]
+        # Required non-null fields the UI derivation depends on.
+        for key in (
+            "id",
+            "user_id",
+            "checkpoint_type",
+            "checkpoint_date",
+            "checkpoint_at",
+            "recorded_at",
+            "ingested_at",
+        ):
+            assert item[key] is not None, f"{key} must be present and non-null"
+        assert item["checkpoint_type"] == "morning"
+        assert item["checkpoint_date"] == today
+
+    async def test_list_date_range_filter(self, client: httpx.AsyncClient, user: User):
+        """Today v2 calls with start_date==end_date==today. A row on another
+        day must not leak into the window."""
+        now = datetime.now(UTC).isoformat()
+        today = str(date.today())
+        # Row outside the window.
+        outside = await client.post(
+            "/api/v1/checkpoints/",
+            json={
+                "user_id": str(user.id),
+                "checkpoint_type": "morning",
+                "checkpoint_date": "2026-04-10",
+                "checkpoint_at": "2026-04-10T08:00:00Z",
+                "recorded_at": "2026-04-10T08:00:00Z",
+            },
+        )
+        assert outside.status_code == 201
+        # Row inside the window.
+        inside = await client.post(
+            "/api/v1/checkpoints/",
+            json={
+                "user_id": str(user.id),
+                "checkpoint_type": "morning",
+                "checkpoint_date": today,
+                "checkpoint_at": now,
+                "recorded_at": now,
+            },
+        )
+        assert inside.status_code == 201
+
+        resp = await client.get(
+            "/api/v1/checkpoints/",
+            params={
+                "user_id": str(user.id),
+                "start_date": today,
+                "end_date": today,
+                "limit": 14,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 1
+        assert body["items"][0]["checkpoint_date"] == today

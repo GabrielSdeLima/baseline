@@ -1,5 +1,5 @@
 import uuid
-from datetime import date
+from datetime import date, datetime  # noqa: F401 (datetime reserved for future use)
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -118,10 +118,24 @@ class MedicationService:
         return MedicationLogResponse.model_validate(log)
 
     async def list_logs(
-        self, user_id: uuid.UUID, offset: int = 0, limit: int = 50
+        self,
+        user_id: uuid.UUID,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        offset: int = 0,
+        limit: int = 50,
     ) -> tuple[list[MedicationLogResponse], int]:
-        items = await self.repo.list_logs_by_user(user_id, offset=offset, limit=limit)
-        total = await self.repo.count_logs_by_user(user_id)
+        if start_date is not None or end_date is not None:
+            items = await self.repo.list_logs_by_user_date_range(
+                user_id, start_date=start_date, end_date=end_date, offset=offset, limit=limit
+            )
+            total = await self.repo.count_logs_by_user_date_range(
+                user_id, start_date=start_date, end_date=end_date
+            )
+        else:
+            items = await self.repo.list_logs_by_user(user_id, offset=offset, limit=limit)
+            total = await self.repo.count_logs_by_user(user_id)
         return [MedicationLogResponse.model_validate(log) for log in items], total
 
 

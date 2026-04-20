@@ -16,7 +16,9 @@ from app.models.agent_instance import AgentInstance
 from app.models.data_source import DataSource
 from app.models.ingestion_run import IngestionRun
 from app.models.user_device import UserDevice
+from app.schemas.garmin_sync import GarminSyncRequest, GarminSyncResponse
 from app.schemas.scale import LatestScaleReading
+from app.services.garmin_sync import perform_on_demand_sync
 from app.services.scale import ScaleService
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
@@ -258,6 +260,24 @@ async def discover_scales(timeout: int = Query(15, ge=3, le=60)):
             await _kill_proc(proc)
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@router.post("/garmin/sync", response_model=GarminSyncResponse)
+async def sync_garmin(body: GarminSyncRequest) -> GarminSyncResponse:
+    """Run a UI-triggered Garmin sync (today's window) and report the outcome.
+
+    Shares the scheduler's :class:`asyncio.Lock` for anti-overlap — if a
+    background tick or a prior click is still running, responds immediately
+    with ``status="already_running"`` and does not create a new run.
+    """
+    result = await perform_on_demand_sync(str(body.user_id))
+    return GarminSyncResponse(
+        status=result.status,
+        run_id=result.run_id,
+        started_at=result.started_at,
+        finished_at=result.finished_at,
+        error_message=result.error_message,
+    )
 
 
 @router.get("/scale/latest", response_model=LatestScaleReading)

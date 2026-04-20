@@ -1,324 +1,228 @@
 # Baseline
 
-A personal **longitudinal health data platform** that cross-references performance metrics (Garmin, wearables) with clinical state data (weight, temperature, symptoms, medication adherence) to enable health inference.
+Personal longitudinal health data platform. Cross-references performance data (Garmin wearable) with clinical state data (weight, temperature, symptoms, medication adherence) to support health inference over time.
 
-The value is in the **data architecture** — real foreign keys, triple temporal modelling, raw/curated layer separation, and cross-domain analytical capability — surfaced through a lightweight UI and a baseline-aware insight layer.
+Built for daily personal use. Also a portfolio case for backend data platform engineering.
 
 ---
 
-## What This Proves
+## The Problem
 
-| Concern | How Baseline Addresses It |
-|---|---|
-| **Relational rigor** | 14 tables, all FKs enforced at DB level, CHECK constraints on value domains, partial indexes for dedup and queue processing |
-| **Temporal precision** | Triple-temporal model (`measured_at` / `recorded_at` / `ingested_at`) for measurements; domain-specific timestamps for workouts, medications, and symptoms |
-| **Data lineage** | Raw payloads preserved as JSONB; curated records carry `raw_payload_id` FK for full traceability |
-| **Ingestion safety** | Idempotent pipeline — duplicate external IDs are de-duped, failures preserve raw data, savepoint rollback prevents partial curated records |
-| **Cross-domain analysis** | Single SQL query correlates HRV, training load, sleep quality, medication adherence, and symptom intensity across a 30-day timeline |
-| **Baseline-aware insights** | Deviation from your individual 14-day rolling baseline (z-score), not fixed absolute thresholds |
+Garmin shows HRV trends. The smart scale shows weight. Nothing connects them. Over months, you have signals that should correlate — HRV dropping when you skip medication, weight drifting when sleep quality degrades — but no tool that tracks this longitudinally and computes it against your own baseline.
+
+Baseline keeps everything in one relational schema, ingests from real devices, and computes signals against the individual — not a population average.
+
+---
+
+## Principles
+
+**Honest semantics.** If data is missing, the system says so. `insufficient_data` is an explicit state throughout the stack. There are no defaults to "all clear" when the baseline window is thin.
+
+**Individual baseline.** Deviation is z-scored against your own 14-day rolling average, not fixed population thresholds. What's a 3σ event for one person may be noise for another.
+
+**Raw data preserved.** Device payloads are stored verbatim (JSONB) before parsing. The curated layer is derived and carries a `raw_payload_id` FK for full lineage. Parsers can be re-run against historical data.
+
+**Operational traceability.** Every sync, scan, or replay creates an `IngestionRun` record with status, counters, and cursor. The system tracks what ran, when, and what it produced.
+
+---
 
 ## Architecture
 
 ```
-React UI  (Today · Timeline · Quick Input)
+Browser (React + TypeScript)
     ↓  /api/v1/*
-FastAPI  (async, OpenAPI at /docs)
-    ↓
-Service layer  (business rules, slug resolution, insight heuristics)
-    ↓
-Repository layer  (query encapsulation, eager loading)
-    ↓
-SQLAlchemy 2.0  (Mapped classes, async sessions)
-    ↓
-PostgreSQL 16  (TIMESTAMPTZ, JSONB, partial indexes)
+FastAPI (async — OpenAPI at /docs)
+    ├── Garmin scheduler  (lifespan task: startup backfill + hourly sync)
+    ├── Service layer     (ingestion pipeline, insight heuristics, operational state)
+    └── SQLAlchemy 2.0 async → PostgreSQL 16
+          ├── Raw         raw_payload (JSONB, append-only)
+          ├── Curated     measurements · checkpoints · symptoms · medications
+          └── Analytical  5 SQL views  (z-scores, deltas, burden, adherence)
 ```
 
-See [docs/architecture.md](docs/architecture.md) for trade-off analysis and [docs/data-model.md](docs/data-model.md) for schema details.
+**Data sources:**
 
-## Quick Start
+| Source | Mechanism | Frequency |
+|--------|-----------|-----------|
+| Garmin Connect | `python-garminconnect`, 10 metrics/day | Automated hourly (lifespan scheduler) |
+| HC900 BLE scale | BLE scan + Python-native decoder, 18 metrics | On-demand (UI button or CLI) |
+| Manual | Check-ins, symptoms, medication doses via Log surface | User-triggered |
 
-```bash
-# Start PostgreSQL
-docker compose up -d
+---
 
-# Install Python dependencies
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+## Surfaces
 
-# Run migrations (creates tables + analytical views + seeds lookup data)
-alembic upgrade head
+### Today
 
-# Seed 30 days of realistic health data
-python scripts/seed.py
+Daily health snapshot. Four insight cards — illness signal, recovery status, physiological deviations, symptom burden — plus medication adherence and the latest scale reading.
 
-# Build the UI (deploys to app/static/ui/ — served by FastAPI)
-npm --prefix ui install
-npm --prefix ui run build
+Each signal uses the two-tier model: SQL views compute z-scores and deltas, Python services apply labels. A metric more than 2σ from your 14-day baseline is flagged. When the baseline has fewer than 3 data points, the card shows "Baseline forming" rather than false-confidence zero-deviation.
 
-# Start the API (serves UI + all endpoints)
-uvicorn app.main:app --reload
+FreshnessBar shows per-source status (Garmin, Scale, check-ins) with last-seen timestamps. Refresh Garmin triggers an on-demand sync without leaving the page.
 
-# Visit the app
-open http://localhost:8000
-```
+### Log
 
-**First-time UI setup:** on first visit, you will be prompted to enter a user ID (UUID). Use the one seed.py printed, or any UUID from the `users` table:
+Full-screen overlay opened via `+ Log`. Five sections:
 
-```bash
-psql -h localhost -p 5433 -U baseline -d baseline -c "SELECT id FROM users LIMIT 1;"
-```
+| Section | What it captures |
+|---------|-----------------|
+| Check-in | Mood, energy, sleep quality, body state (morning and night) |
+| Symptoms | Slug from catalog, intensity 1–10, optional notes |
+| Temperature | °C, with optional retroactive timestamp |
+| Medication | Dose against an active regimen — taken / skipped / delayed |
+| Scale | BLE scan for HC900 (same pipeline as Today's Scan button) |
 
-### Development mode (hot reload for UI)
+### Progress
 
-```bash
-# API on port 8001 (Vite dev proxy target)
-uvicorn app.main:app --reload --port 8001
+14-day retrospective. Four analytical blocks:
 
-# In a second terminal: Vite dev server on port 5173
-npm --prefix ui run dev
+| Block | What it shows |
+|-------|--------------|
+| Protocol consistency | Check-in rate, check-out rate, medication adherence over the window |
+| Signal direction | HRV and resting HR: recent 7-day mean vs prior 7-day mean, with neutral-zone filtering |
+| Reported symptom burden | Recent vs prior 7-day symptom count, direction label, most frequent symptom |
+| Data confidence | Garmin and scale freshness, analytical block coverage, check-in consistency |
 
-# Visit http://localhost:5173
-```
+When data is insufficient, the page shows an explicit empty state with directions — not an empty chart.
 
-Scripts read `BASELINE_API_URL` from the environment and default to `http://localhost:8000`. Override via `BASELINE_API_URL=http://localhost:8001 python scripts/sync_garmin.py ...` (or the `--api-url` flag) when running against the dev-mode API.
+### Record
 
-### Run analytical queries (after seeding)
+Chronological log of all entries, filterable by type: All · Check-ins · Symptoms · Temperature · Scale. Each entry shows a type badge, timestamp, and key values. No editing — the log is append-only.
 
-```bash
-psql -h localhost -p 5433 -U baseline -d baseline -f scripts/analytics.sql
-```
+---
 
-## UI
+## What Makes It Different
 
-A minimal single-page application built to stay out of the way of the data.
+### Honest semantics
 
-**Tech stack:** React 19 · TypeScript · Vite · Tailwind CSS 3 · TanStack Query 5 · date-fns
+`insufficient_data` is not a missing value — it is a computed system state. The analytical views return `NULL` for z-score when the baseline window has fewer than 3 points. The service layer returns `"insufficient_data"` for the classification. The UI renders a distinct state at every level: Progress shows "Still collecting data", Today shows "Baseline forming", the insight summary preserves the count of signals in each state.
 
-**Three views:**
+This is an explicit design choice: absence of data ≠ all clear.
 
-| View | Purpose |
-|------|---------|
-| **Today** | Daily summary — illness signal, recovery status, physiological deviations, symptom burden, medication adherence, latest scale reading. FreshnessBar shows when each data source last reported; Scan button triggers HC900 import. |
-| **Timeline** | 7-day rolling table — HRV, illness signal, recovery status, symptoms, check-ins per day. |
-| **Quick Input** | Modal for logging checkpoints (morning/night), symptoms, medication doses, and manual measurements (body temperature). |
+### Individual baseline
 
-**Key design decisions:**
+Five SQL views compute per-user, per-metric rolling statistics over a 14-day window: `v_daily_metric`, `v_metric_baseline` (avg, stddev, z_score, delta_abs, delta_pct), `v_daily_training_load`, `v_daily_symptom_burden`, `v_medication_adherence`. The z-score is `(value - personal_avg) / personal_stddev`. Thresholds are relative, not absolute.
 
-- No auth — user ID lives in `localStorage`. Single-user by design in V1.
-- Mutations invalidate the `['summary', userId]` cache key immediately; no manual refresh required.
-- `FreshnessBar` makes three lightweight queries: Garmin (via `hrv_rmssd`), Scale (via `weight`), Manual (today's checkpoints). Each shows "today / yesterday / no data" independently.
-- Deviations card shows **"Baseline forming"** when fewer than 3 HRV readings exist, rather than misleading zero-deviation state.
-- Weight is intentionally absent from Quick Input — HC900 ingestion is automatic via `scripts/import_scale.py` or the Scan button in the FreshnessBar.
+### Factual vs derived separation
 
-## Testing
+| Layer | Role | Mutability |
+|-------|------|-----------|
+| `raw_payload` | Device data as received (JSONB) | Append-only |
+| `measurements` | Parsed, typed values | Derived; FK to `raw_payload_id` |
+| Analytical views | Feature engineering (z-scores, deltas) | Recomputable from curated layer |
+| Insight services | Classification heuristics | Versioned via `method` field |
 
-```bash
-# Backend (requires PostgreSQL running)
-pytest -v
+Re-running the HC900 decoder against historical payloads (`scripts/reprocess_hc900.py`) replaces the curated layer without re-fetching from the device. Garmin re-syncs follow the same pattern: new raw snapshot, delete-and-replace curated rows.
 
-# Frontend (no server needed)
-npm --prefix ui test
-```
+### Operational layer
 
-**Total: 278 tests — 206 backend + 72 frontend. All green.**
+Every sync or scan creates an `IngestionRun` record before the work starts:
 
-**Backend tests:**
+- **Garmin sync** (`operation_type=cloud_sync`): cursor advances on success; versioned snapshots preserve every raw payload.
+- **HC900 BLE scan** (`operation_type=ble_scan`): anti-overlap via 409 if a scan is already running; `X-Idempotency-Key` dedup (running → 409, completed → 200, failed → retry).
+- **HC900 reprocess** (`operation_type=replay`): per-payload idempotency key; `--force` releases it.
 
-| File | Count | What it covers |
-|---|---|---|
-| `test_invariants.py` | 14 | FK violations, UNIQUE constraints, CHECK constraints — DB rejects bad data even if app is bypassed |
-| `test_ingestion.py` | 8 | Pipeline idempotency, duplicate dedup, rollback on parser failure, raw→curated traceability |
-| `test_domain_rules.py` | 11 | Slug resolution, medication authorization, checkpoint uniqueness, Pydantic schema validation |
-| `test_api.py` | 8 | HTTP status codes, pagination, error propagation |
-| `test_insights.py` | 63 | Classification functions, view contracts, insufficient_data semantics, stable vs experimental separation, filter/range tests, heuristic regression, feature engineering math, service-level, API |
-| `test_hc900_decoder.py` | 14 | Decoder paths: weight-only, full body-comp, profile validation, decoder-version tagging |
-| `test_hc900_body_composition.py` | 28 | BIA formula accuracy — BMI, BMR, body fat, fat-free mass, muscle, water, protein, bone, FFMI, FMI |
-| `test_scale_integration.py` | 23 | Full HC900 pipeline (V2, 18 metrics), payload audit fields, deduplication, missing-source error, malformed-payload rollback, profile helpers |
-| `test_scale_latest.py` | 12 | `/scale/latest`: never_measured, full_reading, weight_only; multi-user isolation; coherence (all metrics from same raw_payload_id) |
-| `test_garmin_integration.py` | 25 | Parser (10 metrics), timezone semantics (measured_at = noon local), null-safety, deduplication, error paths, sync helpers |
+`AgentInstance` registers the local machine. `UserDevice` stores the scale MAC (normalized to lowercase no-colons). `SourceCursor` tracks the last successful sync date per source.
 
-**Frontend tests:**
-
-| File | Count | What it covers |
-|---|---|---|
-| `today.test.tsx` | 12 | Symptom burden type coercion, medication no-regimens vs 0% adherence, baseline forming state, FreshnessBar rendering, insufficient_data notes |
-| `freshness-bar.test.tsx` | 14 | Per-source chips (Garmin, Scale, Manual), today/yesterday/no-data labels, Scan button states (pending, cancel, success, error) |
-| `quick-input.test.tsx` | 11 | No weight in Measure tab, started_at collapsible, morning/night ScoreRow order, med log empty state, cache invalidation after each mutation type |
-| `timeline.test.tsx` | 10 | Legend, column headers, 7-row count, today marker, week navigation (Prev/Next, date label, disabled states) |
-| `medications.test.tsx` | 14 | Medications page — regimen list, log submission, empty states |
-| `scale-reading-card.test.tsx` | 10 | Four render states: full_reading V2 (18 metrics), full_reading V1 partial (graceful degradation), weight_only (BIA warning), never_measured (empty state) |
-| `scale-scan-invalidation.test.tsx` | 1 | Scan → scale-latest invalidation → card auto-update without page reload |
-
-## Seed Scenario
-
-`scripts/seed.py` generates 30 days (March 2026) of physiologically correlated data:
-
-| Phase | Days | Pattern |
-|---|---|---|
-| **Baseline** | 1–7 | Good sleep, stable HRV (~48 ms), regular training, no symptoms |
-| **Overreach** | 8–14 | Increased volume, HRV dipping (~42 ms), knee pain after long runs |
-| **Illness** | 15–21 | HRV crash (~33 ms), elevated temperature, headache + fatigue, training paused |
-| **Recovery** | 22–30 | Gradual HRV recovery, residual fatigue, return to training |
-
-## Insight Layer
-
-Baseline computes **baseline-aware insights** from the data it tracks.
-
-> **Baseline-first principle:** insights are based on deviation from the user's own 14-day rolling baseline (z-score), not fixed absolute thresholds. What matters is whether a value is unusual *for this person*.
-
-> **Pattern detection for personal health tracking, NOT clinical diagnosis.**
-
-### Two-tier architecture
-
-| Tier | Role | Location |
-|------|------|----------|
-| Tier 1 — Analytical Views | Feature engineering in SQL (no labels, no thresholds) | `view_definitions/insight_views_a1b2c3d4e5f6.py` |
-| Tier 2 — Insight Services | Classification heuristics in Python | `app/services/insights.py` |
-
-### Endpoints
-
-| Endpoint | Stability | Notes |
-|----------|-----------|-------|
-| `GET /api/v1/insights/medication-adherence` | **Stable** | Adherence per regimen, overall % |
-| `GET /api/v1/insights/physiological-deviations` | **Stable** | Metrics where \|z_score\| > threshold |
-| `GET /api/v1/insights/symptom-burden` | **Stable** | Daily symptom burden, peak date |
-| `GET /api/v1/insights/illness-signal` | **Experimental V1** | `method: baseline_deviation_v1` |
-| `GET /api/v1/insights/recovery-status` | **Experimental V1** | `method: load_hrv_heuristic_v1` |
-| `GET /api/v1/insights/summary` | — | Aggregates all insights for today |
-
-Experimental endpoints include a `method` field identifying the heuristic version.
-
-**`insufficient_data`**: when the baseline window has fewer than 3 data points, the signal is explicitly `"insufficient_data"` — not `"low"` or `"recovered"`. Absence of evidence ≠ all clear.
-
-## Garmin Connect Integration
-
-Baseline syncs daily health summaries from Garmin Connect via `python-garminconnect`.
-
-```bash
-# Install Garmin extras
-pip install -e ".[garmin]"
-
-# Configure credentials
-cp scripts/garmin_config.json.example scripts/garmin_config.json
-# edit email, password, token_store, user_timezone
-
-# Sync last 7 days (first run prompts for MFA if enabled, then saves tokens)
-python scripts/sync_garmin.py --user-id <UUID>
-
-# Backfill a specific date range
-python scripts/sync_garmin.py --user-id <UUID> --start-date 2026-03-01 --end-date 2026-04-15
-
-# Dry-run: fetch and decode without submitting
-python scripts/sync_garmin.py --user-id <UUID> --dry-run
-```
-
-**10 metrics imported per day:**
-
-| Metric | Garmin API field | Unit |
-|---|---|---|
-| `resting_hr` | `restingHeartRate` | bpm |
-| `steps` | `totalSteps` | steps |
-| `active_calories` | `activeKilocalories` | kcal |
-| `stress_level` | `averageStressLevel` | score |
-| `spo2` | `averageSpo2` | % |
-| `respiratory_rate` | `avgWakingRespirationValue` | brpm |
-| `body_battery` | `bodyBatteryMostRecentValue` | score |
-| `hrv_rmssd` | `hrvSummary.lastNightAvg` | ms |
-| `sleep_duration` | `sleepTimeSeconds / 60` | min |
-| `sleep_score` | `sleepScores.overall.value` | score |
-
-**`measured_at` semantics:** Daily aggregates use **noon in the user's local timezone** (from `user_timezone` in `garmin_config.json`). This avoids UTC-day-boundary ambiguity regardless of sync time.
-
-**Deduplication:** `garmin_connect_{YYYY-MM-DD}` — one payload per calendar date. Re-syncing the same day is always safe.
-
-**HRV note:** `lastNightAvg` is real overnight RMSSD (ms), not Garmin's categorical status. Requires a compatible device (Fenix 6 Pro+, Fenix 7, Forerunner 955/265, Venu 2 Plus+, etc.).
-
-## Real Scale Integration (HC900 BLE)
-
-Baseline ingests real measurements from an HC900/FG260RB BLE smart scale. The decoder is Python-native (`hc900_ble_v2`) — no Dart runtime or external project required.
-
-```bash
-cp scripts/scale_profile.json.example scripts/scale_profile.json
-# edit height_cm, birth_date, sex
-
-# Step on the scale and run (discovers via BLE, imports automatically)
-python scripts/import_scale.py --user-id <UUID>
-
-# Dry-run: scan and decode but don't submit
-python scripts/import_scale.py --user-id <UUID> --dry-run
-
-# Target a specific scale by MAC address
-python scripts/import_scale.py --user-id <UUID> --mac A0:91:5C:92:CF:17
-
-# Reprocess all historical payloads with the current decoder
-python scripts/reprocess_hc900.py --user-id <UUID>
-```
-
-**How it works:**
-1. `scripts/scan_scale.py` passively scans BLE for HC900 advertisements (company ID `0xA0AC`)
-2. `scripts/import_scale.py` decodes raw bytes natively via `app.integrations.hc900` (Python-native `hc900_ble_v2` — no subprocess)
-3. The normalised payload is POSTed to the API with a deterministic `external_id` for deduplication
-4. `IngestionService._parse_hc900_scale` extracts up to 18 measurements into the curated layer
-
-**Up to 18 metrics per weighing:**
-
-| Category | Slugs |
-|---|---|
-| Primary (sensor) | `weight`, `impedance_adc` |
-| Derived — impedance-independent | `bmi`, `bmr` |
-| Derived — impedance-dependent | `body_fat_pct`, `fat_free_mass_kg`, `fat_mass_kg`, `muscle_mass_kg`, `muscle_pct`, `skeletal_muscle_mass_kg`, `skeletal_muscle_pct`, `water_mass_kg`, `water_pct`, `protein_mass_kg`, `protein_pct`, `bone_mass_kg`, `ffmi`, `fmi` |
-
-**Deduplication key:** `hc900_{mac}_{YYYYmmddTHHMM}_{weight_grams}_{impedance_adc|x}`
-
-**`GET /api/v1/integrations/scale/latest`** returns the most recent weighing as a coherent unit (all metrics from the same `raw_payload_id`) with status `full_reading` / `weight_only` / `never_measured`. The **Latest Scale Reading** card on the Today page renders this directly — no per-metric queries.
-
-> `impedance_adc` is a raw ADC integer, not ohms. Body-composition values are population-level BIA regression estimates, not clinical measurements.
-
-## Analytical Queries
-
-`scripts/analytics.sql` contains 7 cross-domain queries:
-
-1. **HRV 7-day rolling average** — trend analysis with window functions
-2. **Training load vs next-day HRV** — workout RPE × duration correlated with recovery
-3. **Medication adherence rate** — taken/skipped/delayed breakdown per regimen
-4. **Sleep quality → next-morning energy** — checkpoint self-join across types
-5. **Symptom-workout correlation** — symptoms preceded by workouts within 48 h
-6. **Multi-domain daily dashboard** — one query, 6 tables, complete daily picture
-7. **Illness detection signal** — multi-signal pattern matching (temp + HRV + symptoms)
+---
 
 ## Stack
 
 | Component | Choice |
 |---|---|
 | Runtime | Python 3.12+ |
-| Framework | FastAPI |
+| API framework | FastAPI |
 | ORM | SQLAlchemy 2.0 (async) |
 | Migrations | Alembic |
 | Validation | Pydantic v2 |
 | Database | PostgreSQL 16 |
 | Driver | asyncpg |
-| Backend tests | pytest + httpx |
 | Linting | Ruff |
-| IDs | UUIDv7 (time-sortable) |
+| Primary IDs | UUIDv7 (time-sortable) |
 | UI framework | React 19 + TypeScript |
-| UI build | Vite 8 |
-| UI styling | Tailwind CSS 3 |
-| UI state | TanStack Query 5 |
-| UI dates | date-fns 4 |
+| Build | Vite |
+| Styling | Tailwind CSS 3 |
+| Data fetching | TanStack Query 5 |
+| Backend tests | pytest + httpx |
 | Frontend tests | Vitest + Testing Library |
-
-## V1 Boundaries
-
-Explicit about what's **not** included and why:
-
-- **No authentication** — user ID is stored in localStorage. Single-user personal use only; not designed for sharing or multi-user access.
-- **No TimescaleDB** — pure PostgreSQL handles the scale (personal health data = millions of rows, not billions)
-- **No derived metrics** — `is_derived` and `confidence` columns exist as extension points but no pipeline populates them
-- **No unit conversion** — measurements store the unit as-received
-- **No soft-delete** — append-only by design; corrections are new records
-- **No real-time push** — the UI polls via TanStack Query stale-time; no WebSocket or SSE
 
 ---
 
-Built as a professional portfolio case demonstrating data platform thinking, relational modelling rigour, and full-stack backend engineering quality.
+## Tests
+
+**707 total — 406 backend · 301 frontend. All green.**
+
+### Backend (406)
+
+| File | Tests | Coverage |
+|---|---|---|
+| `test_insights.py` | 118 | Classification functions, view contracts, `insufficient_data` semantics, stable vs experimental, feature math, heuristic regression, API |
+| `test_operational_platform.py` | 40 | IngestionRun lifecycle, SourceCursor, AgentInstance, UserDevice |
+| `test_ingestion_run_link.py` | 22 | IngestionRun ↔ raw_payload link table |
+| `test_scale_scan_b4.py` | 19 | Scale scan endpoint — IngestionRun creation, idempotency, anti-overlap |
+| `test_garmin_sync_endpoint.py` | 17 | Garmin sync trigger, status check, run history |
+| `test_garmin_scheduler.py` | 14 | Lifespan scheduler — startup backfill, cursor advance, graceful degradation |
+| `test_hc900_decoder.py` | 14 | Decoder paths: weight-only, full body-comp, profile validation |
+| `test_invariants.py` | 14 | FK violations, UNIQUE constraints, CHECK constraints |
+| `test_garmin_b3.py` | 12 | Versioned snapshots, delete-and-replace curated layer |
+| `test_scale_latest.py` | 12 | `/scale/latest` — full_reading, weight_only, never_measured, multi-user isolation |
+| `test_garmin_integration.py` | 28 | Parser (10 metrics), timezone semantics, null-safety, deduplication |
+| `test_hc900_body_composition.py` | 28 | BIA formula accuracy — BMI, BMR, body fat, 14 derived metrics |
+| `test_scale_integration.py` | 23 | Full HC900 pipeline (V2, 18 metrics), deduplication, rollback |
+| `test_api.py` | 11 | HTTP status codes, pagination, error propagation |
+| `test_domain_rules.py` | 11 | Slug resolution, medication authorization, checkpoint uniqueness |
+| `test_status.py` | 10 | System status endpoint — source freshness, agent registration |
+| `test_ingestion.py` | 8 | Idempotency, dedup, rollback on parser failure |
+| `test_medication_b7.py` | 5 | Medication availability semantics (missing / partial / complete) |
+
+### Frontend (301)
+
+| File | Tests | Coverage |
+|---|---|---|
+| `progress-derivations.test.ts` | 57 | ProgressViewModel — all overallState paths, signal trends, consistency, symptom burden |
+| `record-derivations.test.ts` | 57 | RecordViewModel — filter logic, type badges, sort order |
+| `today-v2-derivations.test.ts` | 27 | TodayViewModel — action ranking, blocker logic, medication states |
+| `freshness-bar.test.tsx` | 19 | Per-source chips, Scan button states (idle, scanning, success, error) |
+| `capture-surface.test.tsx` | 14 | Five-section log surface — section switching, form submission, cache invalidation |
+| `demo-mode.test.tsx` | 14 | Presentation mode: nav filtering, chrome reduction, URL detection |
+| `medications.test.tsx` | 14 | Regimen list, log submission, empty state |
+| `today-v2-home.test.tsx` | 12 | Today page — actions, blockers, completion card |
+| `today-medication-b7.test.ts` | 12 | Medication availability states (missing / partial / complete) in Today |
+| `progress-ui.test.tsx` | 12 | Progress rendering — no_data / limited / mixed / sufficient states |
+| `quick-input.test.tsx` | 11 | Legacy quick input modal |
+| `record-ui.test.tsx` | 10 | Record page — filter chips, entry rendering |
+| `scale-reading-card.test.tsx` | 10 | Four scale states — full_reading V2, V1 partial, weight_only, never_measured |
+| `timeline.test.tsx` | 10 | 7-day grid, column headers, week navigation |
+| `garmin-sync-flow.test.tsx` | 7 | Garmin sync trigger → run status polling |
+| `record-regression.test.tsx` | 6 | Edge cases — empty state, multi-type entries |
+| `progress-regression.test.tsx` | 5 | Degraded states — partial fetch failures |
+| `scale-scan-invalidation.test.tsx` | 1 | BLE scan → cache invalidation → card auto-update |
+
+---
+
+## Limitations
+
+**No authentication.** User ID is self-selected and stored in `localStorage`. Single-user personal tool — not designed for multi-user access or sharing. UUID access provides no security boundary.
+
+**No correlation analysis.** The analytical views and feature layer are built. Querying "does my HRV correlate with sleep quality?" or "does skipping medication affect next-day recovery?" requires a correlation service that doesn't exist yet. The raw material is there.
+
+**Heuristics are experimental.** Illness signal (`method: baseline_deviation_v1`) and recovery status (`method: load_hrv_heuristic_v1`) are useful pattern detectors but aren't validated against clinical outcomes. They are explicitly labeled as experimental in API responses.
+
+**HC900 body composition is estimated.** `impedance_adc` is a raw ADC integer, not ohms. Body fat, muscle, water, and all derived metrics are BIA regression estimates against population-level formulas. They track relative change reliably; absolute values are approximate.
+
+**Local deployment only.** Runs on localhost. Auto-starts on Windows login via Task Scheduler. No TLS, no reverse proxy, no remote access.
+
+**No automated alerts.** No notifications when the illness signal is high. The user checks the Today page.
+
+---
+
+## Next Steps
+
+1. **Medications** — active regimens aren't entered yet; adherence insight shows N/A.
+2. **Workout ingestion** — Garmin activity data exists in the API but isn't parsed or ingested.
+3. **Correlation layer** — the main value proposition of the platform is cross-referencing; the foundation is built, the analysis isn't.
+4. **Authentication** — prerequisite before this becomes shareable or multi-user.
+
+---
+
+See [`docs/architecture.md`](docs/architecture.md) for schema and trade-off detail, [`docs/data-model.md`](docs/data-model.md) for the full ERD, and [`docs/operations.md`](docs/operations.md) for the daily operations guide.
